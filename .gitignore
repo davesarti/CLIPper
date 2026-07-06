@@ -1,3 +1,6 @@
 celeba
-requirements.txt
 celeba_evaluation.json
+features/
+__pycache__/
+.pytest_cache/
+results/

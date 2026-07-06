@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+pandas
+matplotlib
+jupyter
+nbformat
+tqdm
+pytest
