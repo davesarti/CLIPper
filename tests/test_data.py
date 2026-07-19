@@ -28,3 +28,11 @@ def test_load_annotations():
 def test_load_dataset():
     celeba = load_dataset(get_paths())
     assert len(celeba) == 19962  # official CelebA test split
+
+
+def test_load_dataset_accepts_split():
+    paths = get_paths()
+    valid = load_dataset(paths, split="valid")
+    assert len(valid) == 19867
+    # torchvision maps {-1,1} -> {0,1}
+    assert set(valid.attr.unique().tolist()) <= {0, 1}

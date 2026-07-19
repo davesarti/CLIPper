@@ -38,14 +38,14 @@ def get_paths() -> Paths:
     )
 
 
-def load_dataset(paths: Paths) -> CelebA:
+def load_dataset(paths: Paths, split: str = "test") -> CelebA:
     # Note: CelebA appends "celeba/" to the root itself.
     if not (paths.data_root / "celeba").is_dir():
         raise FileNotFoundError(
             f"CelebA folder not found under {paths.data_root}. "
             "Expected <data_root>/celeba/img_align_celeba/..."
         )
-    return CelebA(root=paths.data_root, split="test", download=False)
+    return CelebA(root=paths.data_root, split=split, download=False)
 
 
 def load_annotations(paths: Paths) -> list[dict]:
