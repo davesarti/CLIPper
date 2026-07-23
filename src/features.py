@@ -25,7 +25,9 @@ class ClipEncoder:
     @torch.no_grad()
     def encode_texts(self, prompts: list[str]) -> torch.Tensor:
         model, processor = self._load()
-        inputs = processor(text=prompts, return_tensors="pt", padding=True).to(self.device)
+        inputs = processor(
+            text=prompts, return_tensors="pt", padding=True, truncation=True
+        ).to(self.device)
         feats = model.get_text_features(**inputs).pooler_output.cpu().float()
         return feats / feats.norm(dim=-1, keepdim=True)
 

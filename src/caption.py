@@ -78,6 +78,14 @@ CONFLICTS: dict[str, tuple[str, ...]] = (
     }
 )
 
+# Same-family attributes that can end up simultaneously true in a predicted
+# state (each is classified independently). Clearing one on a query "-attr"
+# must silently clear the rest too, or the caption keeps stale positive
+# fragments (e.g. "-Mustache" leaving "with a goatee, sideburns" standing)
+# or, worse, contradicts the forced-off complement text (e.g. "light-colored
+# hair" from "-Black_Hair" next to a leftover "brown hair").
+_NEGATION_GROUPS: tuple[tuple[str, ...], ...] = (_HAIR_COLORS, _FACIAL_HAIR)
+
 
 def predict_state(scores: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
     """(N, A) attribute scores -> (N, A) bool state via per-attribute thresholds."""
@@ -92,9 +100,13 @@ def flip_state(
     """Apply the query as bit-flips on a copy of `state` (A,) bool.
 
     T+ sets bits (clearing CONFLICTS so the caption stays consistent),
-    T- clears bits. Returns the new state plus the T- attributes as
-    `forced_off`, which render_caption turns into affirmative complements
-    even if the bit was already clear.
+    T- clears bits and, if the attribute belongs to a _NEGATION_GROUPS
+    family, silently clears other set members of that family too (they
+    are not added to `forced_off`, so they're omitted rather than
+    rendering a possibly-contradictory complement of their own). Returns
+    the new state plus the T- attributes as `forced_off`, which
+    render_caption turns into affirmative complements even if the bit
+    was already clear.
     """
     new = state.clone()
     for attr in positives:
@@ -103,6 +115,11 @@ def flip_state(
             new[_INDEX[other]] = False
     for attr in negatives:
         new[_INDEX[attr]] = False
+        for group in _NEGATION_GROUPS:
+            if attr in group:
+                for other in group:
+                    if other != attr:
+                        new[_INDEX[other]] = False
     return new, tuple(negatives)
 
 

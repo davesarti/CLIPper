@@ -8,8 +8,12 @@ steps 1-3; no identity term yet).
 Run with: conda run -n clipper python scripts/run_attribute_caption.py
 Requires results/attribute_thresholds.json from run_attribute_probe.py.
 Reuses the cached test-split features; text encoding takes ~1 min on CPU.
+
+Pass --num-samples/-n to restrict the image pool to the first N images of
+the test split (faster smoke runs); omit it to use the full split.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -23,6 +27,13 @@ from src.caption import predict_state
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import run_caption_benchmark
 from src.features import ClipEncoder, load_or_extract
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "-n", "--num-samples", type=int, default=None,
+    help="Restrict the image pool to the first N images of the test split.",
+)
+args = parser.parse_args()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 thresholds_path = REPO_ROOT / "results" / "attribute_thresholds.json"
@@ -42,6 +53,21 @@ encoder = ClipEncoder()
 
 features = load_or_extract(encoder, celeba, paths.features_dir)
 assert features.shape[0] == len(celeba), "feature/dataset size mismatch"
+
+if args.num_samples is not None:
+    n = args.num_samples
+    if not 0 < n <= features.shape[0]:
+        sys.exit(f"--num-samples must be in (0, {features.shape[0]}], got {n}")
+    features = features[:n]
+    annotations = [
+        {**entry, "ground_truth": {
+            src: [t for t in targets if t < n]
+            for src, targets in entry["ground_truth"].items()
+            if int(src) < n
+        }}
+        for entry in annotations
+    ]
+    annotations = [entry for entry in annotations if entry["ground_truth"]]
 
 pos_emb, neg_emb = build_text_embeddings(encoder.encode_texts)
 states = predict_state(attribute_scores(features, pos_emb, neg_emb), thresholds)
