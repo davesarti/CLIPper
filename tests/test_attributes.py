@@ -57,7 +57,6 @@ from src.attributes import (
     accuracy,
     attribute_scores,
     balanced_accuracy,
-    calibrate_threshold,
     roc_auc,
 )
 
@@ -69,25 +68,6 @@ def test_attribute_scores_is_cosine_difference():
     s = attribute_scores(v, pos, neg)
     assert s.shape == (1, 2)
     assert torch.allclose(s, torch.tensor([[1.0, -1.0]]))
-
-
-def test_calibrate_threshold_separable():
-    # Positives all above 1.0, negatives all below: any threshold in (0.9, 1.1)
-    scores = torch.tensor([0.5, 0.7, 0.9, 1.1, 1.3, 1.5])
-    labels = torch.tensor([0, 0, 0, 1, 1, 1])
-    thr = calibrate_threshold(scores, labels)
-    assert 0.9 < thr < 1.1
-    assert balanced_accuracy(scores, labels, thr) == 1.0
-
-
-def test_calibrate_threshold_handles_offset_distributions():
-    # Both classes entirely below zero: threshold 0 gets bal.acc 0.5,
-    # a calibrated threshold separates them perfectly.
-    scores = torch.tensor([-3.0, -2.8, -2.6, -1.4, -1.2, -1.0])
-    labels = torch.tensor([0, 0, 0, 1, 1, 1])
-    thr = calibrate_threshold(scores, labels)
-    assert balanced_accuracy(scores, labels, thr) == 1.0
-    assert balanced_accuracy(scores, labels, 0.0) == 0.5
 
 
 def test_balanced_accuracy_vs_accuracy_on_imbalance():

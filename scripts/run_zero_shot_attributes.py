@@ -1,6 +1,6 @@
-"""Zero-shot CLIP attribute probe: calibrate thresholds on valid, report on test.
+"""Zero-shot prompt-based attribute classification: calibrate thresholds on valid, report on test.
 
-Run with: conda run -n clipper python scripts/run_attribute_probe.py
+Run with: conda run -n clipper python scripts/run_zero_shot_attributes.py
 First run encodes the ~19.9k-image valid split (~30-60 min on CPU); later
 runs load cached features and finish in seconds.
 """

@@ -12,9 +12,9 @@ import torch
 def fit_linear_probes(
     features: torch.Tensor,
     labels: torch.Tensor,
-    epochs: int = 300,
+    epochs: int = 2000,
     lr: float = 0.05,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fit A independent logistic regressions with full-batch Adam.
 
@@ -34,11 +34,6 @@ def fit_linear_probes(
         loss.backward()
         opt.step()
     return w.detach(), b.detach()
-
-
-def probe_scores(features: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """(N, D) features -> (N, A) probe logits."""
-    return features @ w.T + b
 
 
 def compose_probe(

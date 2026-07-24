@@ -67,6 +67,16 @@ def test_compose_empty_constraints():
     assert torch.allclose(q, v_ref, atol=1e-6)
 
 
+def test_compose_gamma_scales_identity():
+    v_ref = _unit(1.0, 0.0, 0.0)
+    pos = torch.stack([_unit(0.0, 1.0, 0.0)])
+    empty = torch.zeros((0, 3))
+    q_lo = compose(v_ref, pos, empty, gamma=0.1)
+    q_hi = compose(v_ref, pos, empty, gamma=10.0)
+    assert (q_hi @ v_ref) > (q_lo @ v_ref)
+    assert torch.allclose(q_hi, _unit(10.0, 1.0, 0.0), atol=1e-6)
+
+
 def test_rank_orders_by_similarity():
     features = torch.stack([_unit(1, 0, 0), _unit(0, 1, 0), _unit(1, 1, 0)])
     query = _unit(1, 0.1, 0).unsqueeze(0)  # closest to 0, then 2, then 1

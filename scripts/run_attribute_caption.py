@@ -6,7 +6,7 @@ by caption-to-image cosine (docs/method-proposal-attribute-caption.md,
 steps 1-3; no identity term yet).
 
 Run with: conda run -n clipper python scripts/run_attribute_caption.py
-Requires results/attribute_thresholds.json from run_attribute_probe.py.
+Requires results/attribute_thresholds.json from run_zero_shot_attributes.py.
 Reuses the cached test-split features; text encoding takes ~1 min on CPU.
 
 Pass --num-samples/-n to restrict the image pool to the first N images of
@@ -39,7 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 thresholds_path = REPO_ROOT / "results" / "attribute_thresholds.json"
 if not thresholds_path.is_file():
     sys.exit(
-        f"Missing {thresholds_path}: run scripts/run_attribute_probe.py first "
+        f"Missing {thresholds_path}: run scripts/run_zero_shot_attributes.py first "
         "to calibrate the per-attribute thresholds."
     )
 with open(thresholds_path) as f:

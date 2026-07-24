@@ -8,7 +8,7 @@ No SVD, no training — this is the lower bound our fusion module has to beat.
 ## Layout
 
 - `src/` — data loading, prompts + `compose()`/`rank()`, metrics, CLIP wrapper with feature cache; `attributes.py` (zero-shot attribute classifier) and `caption.py` (query bit-flips + caption rendering) for the attribute-caption method
-- `scripts/` — `smoke_test.py` (quick check), `run_baseline.py` (full run, ~45 min CPU once, then cached), `run_attribute_probe.py` (calibrate attribute thresholds), `run_attribute_caption.py` (predict → flip → caption → retrieve pipeline)
+- `scripts/` — `smoke_test.py` (quick check), `run_baseline.py` (full run, ~45 min CPU once, then cached), `run_zero_shot_attributes.py` (zero-shot attribute classification + threshold calibration), `run_attribute_caption.py` (predict → flip → caption → retrieve pipeline), `fit_probes.py` (train the linear attribute probes), `run_probe_gamma_ablation.py` (probe-direction retrieval + gamma sweep)
 - `baseline.ipynb` — executed notebook, seed of the final deliverable
 - `tests/` — 23 pytest tests, model-free
 

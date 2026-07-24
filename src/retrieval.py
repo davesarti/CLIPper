@@ -39,13 +39,15 @@ def compose(
     v_ref: torch.Tensor,
     pos_texts: torch.Tensor,
     neg_texts: torch.Tensor,
+    gamma: float = 1.0,
 ) -> torch.Tensor:
-    """Naive latent arithmetic: normalize(v_ref + sum(pos) - sum(neg)).
+    """Naive latent arithmetic: normalize(gamma * v_ref + sum(pos) - sum(neg)).
 
-    All inputs are expected L2-normalized. This is the vanilla baseline
-    composition; the future fusion module replaces this function.
+    All inputs are expected L2-normalized. gamma weights identity
+    preservation against the attribute edits; gamma=1 is the vanilla
+    baseline composition.
     """
-    q = v_ref + pos_texts.sum(dim=0) - neg_texts.sum(dim=0)
+    q = gamma * v_ref + pos_texts.sum(dim=0) - neg_texts.sum(dim=0)
     return q / q.norm()
 
 

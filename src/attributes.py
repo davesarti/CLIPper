@@ -113,27 +113,6 @@ def accuracy(scores: torch.Tensor, labels: torch.Tensor, threshold: float) -> fl
     return correct / len(labels)
 
 
-def calibrate_threshold(scores: torch.Tensor, labels: torch.Tensor) -> float:
-    """Threshold maximizing balanced accuracy; midpoint between adjacent scores.
-
-    Sorts once and sweeps all N cut points with cumulative sums.
-    Assumes both classes present.
-    """
-    order = scores.argsort()
-    s = scores[order]
-    y = labels[order].float()
-    n_pos = y.sum()
-    n_neg = len(y) - n_pos
-    # Cut after index i => predict positive for scores > s[i].
-    tp = n_pos - y.cumsum(0)          # positives strictly above the cut
-    tn = (1 - y).cumsum(0)            # negatives at or below the cut
-    bal = (tp / n_pos + tn / n_neg) / 2
-    best = int(bal.argmax())
-    if best == len(s) - 1:            # degenerate: predict all negative
-        return s[best].item() + 1e-6
-    return ((s[best] + s[best + 1]) / 2).item()
-
-
 def calibrate_threshold_prevalence(scores: torch.Tensor, labels: torch.Tensor) -> float:
     """Threshold matching the predicted positive rate to the true prevalence.
 

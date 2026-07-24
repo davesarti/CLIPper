@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 
 from src.caption import encode_caption, flip_state, render_caption
+from src.probes import compose_probe
 from src.retrieval import PROMPTS, compose, parse_query, rank
 
 KS = (1, 5, 10)
@@ -57,6 +58,7 @@ def run_benchmark(
     annotations: list[dict],
     image_features: torch.Tensor,
     encode_texts: Callable[[list[str]], torch.Tensor],
+    gamma: float = 1.0,
 ) -> pd.DataFrame:
     """Evaluate the compose+rank baseline on every query in `annotations`.
 
@@ -64,6 +66,7 @@ def run_benchmark(
         row i = dataset index i.
     encode_texts: maps a list of prompt strings to (M, D) L2-normalized
         embeddings (injected so tests can fake it and the model loads once).
+    gamma: reference-image weight passed through to compose.
     """
     rows = []
     for entry in annotations:
@@ -75,7 +78,38 @@ def run_benchmark(
 
         source_indices = [int(k) for k in entry["ground_truth"].keys()]
         query_vecs = torch.stack([
-            compose(image_features[i], pos_texts, neg_texts) for i in source_indices
+            compose(image_features[i], pos_texts, neg_texts, gamma=gamma)
+            for i in source_indices
+        ])
+        order = rank(query_vecs, image_features, exclude=source_indices)
+        rows.append(_query_row(entry, order, source_indices))
+
+    return _with_mean_row(rows)
+
+
+def run_probe_benchmark(
+    annotations: list[dict],
+    image_features: torch.Tensor,
+    directions: torch.Tensor,
+    attr_index: dict[str, int],
+    gamma: float = 1.0,
+) -> pd.DataFrame:
+    """Evaluate compose_probe+rank on every query in `annotations`.
+
+    directions: (A, D) L2-normalized probe weight directions;
+    attr_index: attribute name -> row of `directions`.
+    Only the attributes named in each query are used.
+    """
+    rows = []
+    for entry in annotations:
+        positives, negatives = parse_query(entry["query"])
+        pos_dirs = directions[[attr_index[a] for a in positives]]
+        neg_dirs = directions[[attr_index[a] for a in negatives]]
+
+        source_indices = [int(k) for k in entry["ground_truth"].keys()]
+        query_vecs = torch.stack([
+            compose_probe(image_features[i], pos_dirs, neg_dirs, gamma=gamma)
+            for i in source_indices
         ])
         order = rank(query_vecs, image_features, exclude=source_indices)
         rows.append(_query_row(entry, order, source_indices))
