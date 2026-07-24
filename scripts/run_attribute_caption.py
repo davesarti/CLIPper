@@ -23,7 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.attributes import ATTRIBUTE_PROMPTS, attribute_scores, build_text_embeddings
-from src.caption import predict_state
+from src.caption import predict_state, resolve_exclusive_groups
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import run_caption_benchmark
 from src.features import ClipEncoder, load_or_extract
@@ -43,8 +43,9 @@ if not thresholds_path.is_file():
         "to calibrate the per-attribute thresholds."
     )
 with open(thresholds_path) as f:
-    thresholds_by_attr = json.load(f)
-thresholds = torch.tensor([thresholds_by_attr[a] for a in ATTRIBUTE_PROMPTS])
+    calibration = json.load(f)
+thresholds = torch.tensor([calibration["thresholds"][a] for a in ATTRIBUTE_PROMPTS])
+reliable = torch.tensor([a not in calibration["unreliable"] for a in ATTRIBUTE_PROMPTS])
 
 paths = get_paths()
 celeba = load_dataset(paths)
@@ -70,7 +71,11 @@ if args.num_samples is not None:
     annotations = [entry for entry in annotations if entry["ground_truth"]]
 
 pos_emb, neg_emb = build_text_embeddings(encoder.encode_texts)
-states = predict_state(attribute_scores(features, pos_emb, neg_emb), thresholds)
+scores = attribute_scores(features, pos_emb, neg_emb)
+# Near-chance attributes are masked before group resolution so an unreliable
+# family member can never win its exclusive group.
+states = predict_state(scores, thresholds) & reliable
+states = resolve_exclusive_groups(states, scores - thresholds)
 
 df = run_caption_benchmark(annotations, features, states, encoder.encode_texts)
 

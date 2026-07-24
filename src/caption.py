@@ -78,6 +78,37 @@ CONFLICTS: dict[str, tuple[str, ...]] = (
     }
 )
 
+# Families where the *predicted* state should assert at most one member:
+# independent per-attribute classifiers routinely set several (e.g. two hair
+# colors), and rendering more than the most confident one puts a contradiction
+# or a hallucination in every caption. Facial-hair styles can genuinely
+# co-occur, but keeping only the best-supported one merely omits the rest —
+# harmless for a caption — while resolving the No_Beard contradiction.
+EXCLUSIVE_GROUPS: tuple[tuple[str, ...], ...] = (
+    _HAIR_COLORS + ("Bald",),
+    ("No_Beard",) + _FACIAL_HAIR,
+    ("Straight_Hair", "Wavy_Hair"),
+)
+
+
+def resolve_exclusive_groups(states: torch.Tensor, margins: torch.Tensor) -> torch.Tensor:
+    """(N, A) bool states -> copy where each EXCLUSIVE_GROUPS family keeps
+    only its highest-margin positive member per row.
+
+    margins: (N, A) confidence (score - threshold); only compared within a
+    row's positive members, so its scale doesn't matter.
+    """
+    new = states.clone()
+    for group in EXCLUSIVE_GROUPS:
+        idx = torch.tensor([_INDEX[a] for a in group])
+        members = states[:, idx]
+        m = margins[:, idx].masked_fill(~members, float("-inf"))
+        winner = torch.zeros_like(members)
+        winner[torch.arange(len(members)), m.argmax(dim=1)] = True
+        new[:, idx] = winner & members
+    return new
+
+
 # Same-family attributes that can end up simultaneously true in a predicted
 # state (each is classified independently). Clearing one on a query "-attr"
 # must silently clear the rest too, or the caption keeps stale positive

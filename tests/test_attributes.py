@@ -103,3 +103,42 @@ def test_roc_auc_extremes():
     labels = torch.tensor([0, 0, 0, 1, 1, 1])
     assert roc_auc(torch.tensor([1.0, 2, 3, 4, 5, 6]), labels) == 1.0
     assert roc_auc(torch.tensor([6.0, 5, 4, 3, 2, 1]), labels) == 0.0
+
+
+from src.attributes import calibrate_threshold_precision, calibrate_threshold_prevalence
+
+
+def test_calibrate_threshold_prevalence_matches_positive_rate():
+    scores = torch.tensor([0.1, 0.9, 0.3, 0.7, 0.5, 0.2])
+    labels = torch.tensor([0, 1, 0, 1, 0, 0])  # prevalence 2/6
+    thr = calibrate_threshold_prevalence(scores, labels)
+    assert (scores > thr).sum() == 2
+
+
+def test_calibrate_threshold_precision_separable_maximizes_recall():
+    # Perfectly separable: the floor is met by taking every positive.
+    scores = torch.tensor([0.5, 0.7, 0.9, 1.1, 1.3, 1.5])
+    labels = torch.tensor([0, 0, 0, 1, 1, 1])
+    thr = calibrate_threshold_precision(scores, labels, min_precision=1.0)
+    preds = scores > thr
+    assert preds.tolist() == [False, False, False, True, True, True]
+
+
+def test_calibrate_threshold_precision_floor_cuts_false_positives():
+    # Descending scores: labels 1,1,0,0,0,0. Precision at k=2 is 1.0,
+    # at k=3 drops to 2/3 < 0.9 -> the cut must stop after the top two.
+    scores = torch.tensor([6.0, 5.0, 4.0, 3.0, 2.0, 1.0])
+    labels = torch.tensor([1, 1, 0, 0, 0, 0])
+    thr = calibrate_threshold_precision(scores, labels, min_precision=0.9)
+    assert (scores > thr).sum() == 2
+    assert labels[scores > thr].all()
+
+
+def test_calibrate_threshold_precision_falls_back_to_prevalence():
+    # Scores anti-correlated with labels: no cut reaches the floor,
+    # so the threshold falls back to prevalence matching.
+    scores = torch.tensor([6.0, 5.0, 4.0, 3.0, 2.0, 1.0])
+    labels = torch.tensor([0, 0, 0, 0, 1, 1])
+    thr = calibrate_threshold_precision(scores, labels, min_precision=0.9)
+    assert thr == calibrate_threshold_prevalence(scores, labels)
+    assert (scores > thr).sum() == 2

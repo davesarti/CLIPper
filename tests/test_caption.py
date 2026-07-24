@@ -82,6 +82,55 @@ def test_flip_facial_hair_clears_no_beard_and_vice_versa():
     assert not new[ATTRS.index("Mustache")]
 
 
+# --- exclusive groups -------------------------------------------------------
+
+from src.caption import EXCLUSIVE_GROUPS, resolve_exclusive_groups
+
+
+def _margins_for(values: dict[str, float]) -> torch.Tensor:
+    m = torch.zeros(1, len(ATTRS))
+    for attr, v in values.items():
+        m[0, ATTRS.index(attr)] = v
+    return m
+
+
+def test_resolve_keeps_only_max_margin_hair_color():
+    states = make_state("Black_Hair", "Brown_Hair", "Smiling").unsqueeze(0)
+    margins = _margins_for({"Black_Hair": 0.1, "Brown_Hair": 0.3})
+    new = resolve_exclusive_groups(states, margins)
+    assert not new[0, ATTRS.index("Black_Hair")]
+    assert new[0, ATTRS.index("Brown_Hair")]
+    assert new[0, ATTRS.index("Smiling")]  # non-group bits untouched
+
+
+def test_resolve_settles_no_beard_vs_facial_hair_contradiction():
+    states = make_state("No_Beard", "Mustache", "Sideburns").unsqueeze(0)
+    margins = _margins_for({"No_Beard": 0.05, "Mustache": 0.2, "Sideburns": 0.1})
+    new = resolve_exclusive_groups(states, margins)
+    assert new[0, ATTRS.index("Mustache")]
+    assert not new[0, ATTRS.index("No_Beard")]
+    assert not new[0, ATTRS.index("Sideburns")]
+
+
+def test_resolve_leaves_single_member_and_empty_groups_alone():
+    states = make_state("Blond_Hair", "Male").unsqueeze(0)
+    new = resolve_exclusive_groups(states, torch.zeros(1, len(ATTRS)))
+    assert (new == states).all()
+
+
+def test_resolve_does_not_mutate_input():
+    states = make_state("Black_Hair", "Brown_Hair").unsqueeze(0)
+    resolve_exclusive_groups(states, torch.zeros(1, len(ATTRS)))
+    assert states[0, ATTRS.index("Black_Hair")]
+
+
+def test_exclusive_groups_use_known_attributes():
+    for group in EXCLUSIVE_GROUPS:
+        assert len(group) >= 2
+        for attr in group:
+            assert attr in ATTRS
+
+
 # --- render -----------------------------------------------------------------
 
 def test_render_empty_state_is_a_person():

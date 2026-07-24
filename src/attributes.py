@@ -134,6 +134,46 @@ def calibrate_threshold(scores: torch.Tensor, labels: torch.Tensor) -> float:
     return ((s[best] + s[best + 1]) / 2).item()
 
 
+def calibrate_threshold_prevalence(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """Threshold matching the predicted positive rate to the true prevalence.
+
+    With P positives in `labels`, cuts so exactly the top-P scores predict
+    positive; midpoint between adjacent scores.
+    """
+    n_pos = int(labels.sum())
+    s = scores.sort(descending=True).values
+    if n_pos == 0:
+        return s[0].item() + 1e-6
+    if n_pos >= len(s):
+        return s[-1].item() - 1e-6
+    return ((s[n_pos - 1] + s[n_pos]) / 2).item()
+
+
+def calibrate_threshold_precision(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    min_precision: float = 0.7,
+) -> float:
+    """Lowest threshold whose precision stays >= min_precision (max recall).
+
+    For a caption pipeline a false positive (hallucinated fragment) costs
+    more than a false negative (omission), so recall is maximized only
+    subject to a precision floor. Falls back to prevalence matching when no
+    cut reaches the floor (near-chance attributes).
+    """
+    order = scores.argsort(descending=True)
+    s = scores[order]
+    y = labels[order].float()
+    precision = y.cumsum(0) / torch.arange(1, len(y) + 1)
+    ok = (precision >= min_precision).nonzero()
+    if len(ok) == 0:
+        return calibrate_threshold_prevalence(scores, labels)
+    best = int(ok.max())                  # deepest cut still meeting the floor
+    if best == len(s) - 1:
+        return s[-1].item() - 1e-6
+    return ((s[best] + s[best + 1]) / 2).item()
+
+
 def roc_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
     """Threshold-free ranking quality (Mann-Whitney U / rank-sum form)."""
     order = scores.argsort()
