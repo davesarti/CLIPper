@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 
 from src.caption import encode_caption, flip_state, render_caption
+from src.cpas import CPAS, pad_queries
 from src.probes import compose_probe
 from src.retrieval import PROMPTS, compose, parse_query, rank
 
@@ -115,6 +116,154 @@ def run_probe_benchmark(
         rows.append(_query_row(entry, order, source_indices))
 
     return _with_mean_row(rows)
+
+
+def build_val_benchmark(
+    labels: torch.Tensor,
+    query_specs: list[tuple[list[int], list[int]]],
+    proxy_rows: list[int],
+    directions: torch.Tensor,
+    per_query: int = 200,
+    min_gt: int = 3,
+    seed: int = 0,
+) -> list[dict]:
+    """Held-out replica of the eval benchmark for checkpoint selection.
+
+    Mirrors how the real celeba_evaluation.json ground truth is built - images
+    that satisfy the query constraints and match the reference on the identity-
+    proxy attributes - but over a held-out image pool (the val split), so it
+    tracks the true R@10 without ever touching the test references or the test
+    ground truth. Only the query *shapes* are shared with the benchmark, which
+    is exactly the distribution we are graded on.
+
+    labels: (N, A) bool for the val pool (references and database are this pool);
+    query_specs: (positive rows, negative rows) per query, indexing `labels`;
+    proxy_rows: identity-proxy attribute rows; directions: (A, D) probe dirs.
+    Returns one task dict per query with precomputed reference indices, a
+    (R, N) ground-truth mask, and the padded (dirs, signs, mask) model inputs.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    n = labels.shape[0]
+    tasks = []
+    for pos_rows, neg_rows in query_specs:
+        satisfies = torch.ones(n, dtype=torch.bool)
+        if pos_rows:
+            satisfies &= labels[:, pos_rows].all(dim=1)
+        if neg_rows:
+            satisfies &= ~labels[:, neg_rows].any(dim=1)
+        # A queried attribute must differ from the reference by construction, so
+        # it cannot be part of the identity match (mirrors mining target choice).
+        queried = set(pos_rows) | set(neg_rows)
+        prox = [r for r in proxy_rows if r not in queried]
+
+        refs, masks = [], []
+        for r in torch.randperm(n, generator=gen).tolist():
+            if prox:
+                agree = (labels[:, prox] == labels[r, prox]).all(dim=1)
+            else:
+                agree = torch.ones(n, dtype=torch.bool)
+            gt = satisfies & agree
+            gt[r] = False
+            if int(gt.sum()) >= min_gt:
+                refs.append(r)
+                masks.append(gt)
+            if len(refs) >= per_query:
+                break
+        if not refs:
+            continue
+        refs_t = torch.tensor(refs)
+        dirs, signs, mask = pad_queries([(pos_rows, neg_rows)] * len(refs), directions)
+        tasks.append({
+            "refs": refs_t,
+            "gt_mask": torch.stack(masks),
+            "dirs": dirs, "signs": signs, "mask": mask,
+        })
+    return tasks
+
+
+@torch.no_grad()
+def score_val_benchmark(model: CPAS, db: torch.Tensor, tasks: list[dict], k: int = 10) -> float:
+    """Mean Recall@k of `model` over a val benchmark from `build_val_benchmark`.
+
+    db: (N, D) L2-normalized features of the val pool (the ranking database);
+    a query counts as a hit when any ground-truth image is in its top-k.
+    """
+    model.eval()
+    device = db.device
+    hits, total = 0, 0
+    for task in tasks:
+        refs = task["refs"].to(device)
+        q = model(
+            db[refs], task["dirs"].to(device),
+            task["signs"].to(device), task["mask"].to(device),
+        )
+        sims = q @ db.T
+        sims[torch.arange(refs.shape[0], device=device), refs] = float("-inf")
+        top = sims.topk(k, dim=1).indices
+        hit = task["gt_mask"].to(device).gather(1, top).any(dim=1)
+        hits += int(hit.sum())
+        total += refs.shape[0]
+    return hits / max(total, 1)
+
+
+@torch.no_grad()
+def run_cpas_benchmark(
+    annotations: list[dict],
+    image_features: torch.Tensor,
+    model: CPAS,
+    directions: torch.Tensor,
+    attr_index: dict[str, int],
+) -> pd.DataFrame:
+    """Evaluate the trained CPAS combiner on every query in `annotations`.
+
+    Same protocol as run_probe_benchmark; the fixed composition is replaced by
+    the model, which predicts a reference weight, per-attribute step sizes and
+    direction bends for each (source image, query) pair.
+    """
+    model.eval()
+    rows = []
+    for entry in annotations:
+        positives, negatives = parse_query(entry["query"])
+        pos_rows = [attr_index[a] for a in positives]
+        neg_rows = [attr_index[a] for a in negatives]
+
+        source_indices = [int(k) for k in entry["ground_truth"].keys()]
+        dirs, signs, mask = pad_queries(
+            [(pos_rows, neg_rows)] * len(source_indices), directions
+        )
+        query_vecs = model(image_features[source_indices], dirs, signs, mask)
+        order = rank(query_vecs, image_features, exclude=source_indices)
+        rows.append(_query_row(entry, order, source_indices))
+
+    return _with_mean_row(rows)
+
+
+@torch.no_grad()
+def probe_drift(
+    query_vecs: torch.Tensor,
+    v_ref: torch.Tensor,
+    weights: torch.Tensor,
+    biases: torch.Tensor,
+    pos_rows: list[int],
+    neg_rows: list[int],
+) -> dict[str, float]:
+    """Mean probe-logit shift from reference to query, queried vs. the rest.
+
+    `queried` is signed so that positive means "moved the right way" (+ for T+
+    attributes, - for T-); `non_queried_abs` is leakage into the attributes the
+    query never mentioned, which non-orthogonal directions cause and a
+    conditioned composition should shrink (docs/method-proposal-cpas.md S4).
+    """
+    shift = (query_vecs - v_ref) @ weights.T  # biases cancel
+    queried = pos_rows + neg_rows
+    others = [a for a in range(weights.shape[0]) if a not in set(queried)]
+    wanted = torch.cat(
+        [shift[:, pos_rows], -shift[:, neg_rows]], dim=1
+    ) if queried else shift[:, :0]
+    return {
+        "queried": float(wanted.mean()) if queried else 0.0,
+        "non_queried_abs": float(shift[:, others].abs().mean()),
+    }
 
 
 def run_caption_benchmark(

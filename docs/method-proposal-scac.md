@@ -6,39 +6,40 @@
 |---|---|
 | Dataset | CelebA (40 binary attributes); test split as fixed retrieval database |
 | Encoder | Frozen CLIP ViT-B/32, d = 512 |
+| Attribute representation | Signed **probe directions** `ŵ_a` (frozen linear-probe weights, `results/probe_weights.pt`) |
 | Trainable | ≈ 7 M parameters (lightweight combiner) |
 | Budget | Single Colab GPU; CLIP features pre-computed once |
 
 ## 0. Problem setup
 
-Given a reference image `v_ref`, positive attributes **T+** and negative attributes **T−**, build a fusion module Φ producing one query embedding. Retrieval over a fixed, pre-embedded database must return images that keep the reference's identity, satisfy every T+ attribute, and avoid every T− attribute. Baseline to beat: naive CLIP arithmetic
+Given a reference image `v_ref`, positive attributes **T+** and negative attributes **T−**, build a fusion module Φ producing one query embedding. Retrieval over a fixed, pre-embedded database must return images that keep the reference's identity, satisfy every T+ attribute, and avoid every T− attribute. Baseline to beat: **probe-direction composition** (`docs/method-probe-direction-retrieval.md`), the current best method
 
 ```
-v_target ≈ v_ref + Σ t+ − Σ t− ,  ranked by cosine similarity
+q = normalize( γ · v_ref + Σ ŵ+ − Σ ŵ− ),  γ = 0.6,  ranked by cosine similarity
 ```
 
-Only the query side (plus optional light re-ranking of a shortlist) may change.
+where `ŵ_a` are the normalized linear-probe weight vectors. Only the query side (plus optional light re-ranking of a shortlist) may change.
 
 ## 1. Fusion mechanism and the failure mode it fixes
 
-**Mechanism.** A small transformer-based combiner fuses `v_ref` with attribute text embeddings tagged by learned *sign embeddings* (one for "must have", one for "must avoid"), producing the query as a **gated residual on `v_ref`**. The T+/T− asymmetry is enforced architecturally (sign tokens) but primarily through the loss: training mines **violation negatives** — images that satisfy T+ but also contain a T− attribute — so the network learns that negative attributes define an exclusion region, not a direction to walk backwards along.
+**Mechanism.** A small transformer-based combiner fuses `v_ref` with the queried **probe directions** tagged by learned *sign embeddings* (one for "must have", one for "must avoid"), producing the query as a **gated residual on `v_ref`**. Negative attributes enter as `+ŵ_a` tagged with the negative sign embedding — *not* as `−ŵ_a` — so the network is never pre-committed to "negation = subtraction". The T+/T− asymmetry is enforced architecturally (sign tokens) but primarily through the loss: training mines **violation negatives** — images that satisfy T+ but also contain a T− attribute — so the network learns that negative attributes define an exclusion region, not a direction to walk backwards along.
 
-**Why the arithmetic / SVD-subspace baseline fails.** It treats attributes as globally linear, mutually independent directions in CLIP space:
+**Why the fixed linear rule fails.** Probe-direction composition treats attributes as mutually independent directions with one global reference weight:
 
-1. **Subtraction overshoots.** Subtracting `t("beard")` doesn't land on "no beard" — it moves toward the semantic opposite of everything correlated with beard (masculinity, age), destroying identity. Negation is not the additive inverse in CLIP space; CLIP is famously bad at "not X".
-2. **Modality gap.** CLIP image and text embeddings live on two separated cones (Liang et al., NeurIPS 2022); adding raw text vectors to an image vector mixes the cones with uncalibrated magnitudes, so one strong text direction can dominate `v_ref`.
-3. **No conditioning.** The right direction for "add blond hair" depends on the reference (dark-haired man vs. gray-haired woman); a global text direction — or a global SVD subspace — cannot adapt per reference. Attention over the reference token fixes exactly this.
+1. **Subtraction overshoots.** Subtracting `ŵ_beard` doesn't land on "no beard" — the probe normal also carries everything correlated with beard (masculinity, age), so walking backwards along it drags identity with it. Negation is not the additive inverse of an attribute direction.
+2. **Non-orthogonal directions.** The 40 probe normals are strongly correlated (`ŵ_blond` shares components with `ŵ_male`, etc.). Naive addition double-counts or partially cancels the shared components, and every edit leaks into correlated non-queried attributes. The correct joint step is an *oblique* function of the whole edit set, not a sum of per-attribute steps.
+3. **No conditioning.** The right step for "add blond hair" depends on the reference (dark-haired man vs. gray-haired woman); a global direction with a global γ cannot adapt per reference. Attention over the reference token fixes exactly this — and turns the single tuned γ into a per-query learned gate.
 
-Closest prior art: the **Combiner** of Baldrati et al. (CVPR 2022, CLIP4Cir) and **TIRG** (Vo et al., CVPR 2019) for the gated residual. SCAC's novelty: multi-attribute *set* input with signed tokens, and the violation-negative training signal for explicit negation — neither handles T− at all.
+Closest prior art: the **Combiner** of Baldrati et al. (CVPR 2022, CLIP4Cir) and **TIRG** (Vo et al., CVPR 2019) for the gated residual. SCAC's novelty: multi-attribute *set* input with signed tokens in **image space** (learned probe directions rather than text embeddings, avoiding the modality gap of Liang et al., NeurIPS 2022 — already validated by the probe-vs-prompt ablation), and the violation-negative training signal for explicit negation — neither prior work handles T− at all.
 
 ## 2. Architecture
 
-All embeddings are frozen CLIP ViT-B/32 outputs, d = 512, L2-normalized.
+All inputs are frozen and L2-normalized, d = 512: image embeddings from CLIP ViT-B/32, attribute directions from the trained linear probes.
 
 **Inputs**
 - `v_ref ∈ R^512`
-- `t+_i = E_text("a photo of a person with {attr_i}")`, i = 1..P (prompt-ensembled over 4–6 templates)
-- `t−_j` likewise, j = 1..N
+- `ŵ+_i = w_i / ‖w_i‖`, i = 1..P — normalized probe weight vectors of the positive attributes (frozen, from `results/probe_weights.pt`)
+- `ŵ−_j` likewise for the negative attributes, j = 1..N (fed with positive sign; the `s_neg` tag carries the negation)
 
 **Learned components**
 - Sign embeddings `s_pos, s_neg, s_ref ∈ R^512` (3 vectors)
@@ -49,8 +50,8 @@ All embeddings are frozen CLIP ViT-B/32 outputs, d = 512, L2-normalized.
 **Forward pass**
 
 ```
-X = [ v_ref + s_ref ;  t+_1 + s_pos ; … ; t+_P + s_pos ;
-      t−_1 + s_neg ; … ; t−_N + s_neg ]        # (1+P+N, 512)
+X = [ v_ref + s_ref ;  ŵ+_1 + s_pos ; … ; ŵ+_P + s_pos ;
+      ŵ−_1 + s_neg ; … ; ŵ−_N + s_neg ]        # (1+P+N, 512)
 
 Z = f_θ(X)                                      # full self-attention, no mask
 z = Z[0]                                        # reference-slot output
@@ -62,20 +63,36 @@ q = normalize( (1−α)·v_ref + α·h_θ(z) )        # gated residual → query
 ```python
 class SCAC(nn.Module):
     def __init__(self, d=512, layers=2, heads=8): ...
-    def forward(self, v_ref, t_pos, t_neg):
-        # v_ref: (B, 512) · t_pos: (B, P, 512) · t_neg: (B, N, 512)
+    def forward(self, v_ref, w_pos, w_neg):
+        # v_ref: (B, 512) · w_pos: (B, P, 512) · w_neg: (B, N, 512)
         # returns q: (B, 512), L2-normalized
 ```
 
-**Retrieval.** Cosine similarity of `q` against the pre-computed database. Optional light re-rank on top-K (K = 100), never touching the database embeddings:
+Full self-attention is the mechanism that addresses direction non-orthogonality:
+attribute tokens attend to *each other* (the joint step for a set of correlated
+edits is computed on the whole set, not summed per attribute) and to the
+reference (step sizes adapt to where `v_ref` already is). The gate `α` replaces
+the globally tuned γ with a per-query trade-off between preserving the reference
+and applying the edit. Near initialization the output stays close to a linear
+blend of reference and directions, i.e. the model starts near the arithmetic
+baseline and can only improve on it.
+
+**Retrieval.** Cosine similarity of `q` against the pre-computed database. Optional light re-rank on top-K (K = 100), never touching the database embeddings — penalize candidates the T− probes still fire on:
 
 ```
-score(v) = cos(q, v) − λ · max_j cos(t−_j, v)
+score(v) = cos(q, v) − λ · max_j σ(w−_j · v + b−_j)
 ```
 
 with a single scalar λ tuned on validation (ablated in §4).
 
-**How T+ and T− differ.** (a) Different sign embeddings let attention treat them differently; (b) the gate α preserves identity when constraints are few/weak; (c) crucially, the loss penalizes T− violations with dedicated hard negatives, so `s_neg` learns "steer away from images scoring high on this text" rather than "subtract this vector"; (d) the λ re-rank term is a third, explicit asymmetry.
+**How T+ and T− differ.** (a) Different sign embeddings let attention treat them differently; (b) the gate α preserves identity when constraints are few/weak; (c) crucially, the loss penalizes T− violations with dedicated hard negatives, so `s_neg` learns "steer away from images this probe fires on" rather than "subtract this vector"; (d) the λ re-rank term is a third, explicit asymmetry.
+
+**Evidence check.** The CPAS ablations (`docs/method-proposal-cpas.md` §7) found
+that blocking attribute-to-attribute attention costs nothing measurable on the
+current benchmark, so the two-layer trunk is not yet justified by results: on
+that evidence SCAC's expected gain lies in the violation-negative training
+signal rather than in the architecture. Re-check on a benchmark with more
+multi-attribute queries before committing to the full model.
 
 **Param count.** Per transformer layer ≈ 4·512² (attn) + 2·512·2048 (FFN) ≈ 3.15 M → ~6.3 M for two layers, + heads ≈ 0.5 M, + 3 sign vectors: **≈ 7 M trainable params**. All CLIP features are cached, so each run trains in well under an hour on a Colab T4.
 
@@ -111,12 +128,15 @@ Optional anchor regularizer `+ β·(1 − cos(q, v_ref))`, β ≈ 0.1; tune agai
 
 | Variant | Change | Question it answers |
 |---|---|---|
-| **SCAC-noSign** | Drop sign embeddings; feed T− as plain tokens, subtract at output: `q′ = normalize(q − Σ t−)` | Does learned negation beat arithmetic negation? |
+| **SCAC-noSign** | Drop sign embeddings; feed T− as plain tokens, subtract at output: `q′ = normalize(q − Σ ŵ−)` | Does learned negation beat arithmetic negation? |
 | **SCAC-noViolation** | Same architecture, in-batch negatives only | Training signal vs. architecture (prediction: signal matters more) |
-| **MLP-Combiner** | CLIP4Cir-style MLP on `[v_ref ; mean(t+) ; mean(t−)]` (~1 M params) | Is attention over individual attribute tokens needed, especially k ≥ 2? |
+| **SCAC-text** | Replace probe tokens with prompt-ensembled text embeddings (the original SCAC input) | Do in-space probe directions still matter once the combiner is learned? |
+| **MLP-Combiner** | CLIP4Cir-style MLP on `[v_ref ; mean(ŵ+) ; mean(ŵ−)]` (~1 M params) | Is attention over individual attribute tokens needed, especially k ≥ 2? |
 | **± λ re-rank** | Toggle re-rank term on every variant | Did fusion learn negation, or did the re-ranker patch it? |
 
-Report all variants against the arithmetic baseline and the SVD-subspace method, stratified by k = 1/2/3 and by positive-only / negative-only / mixed queries.
+Report all variants against the probe-direction composition baseline (γ = 0.6), stratified by k = 1/2/3 and by positive-only / negative-only / mixed queries.
+
+**Probe-drift diagnostic.** Because the probes are frozen classifiers, any output `q` can be scored by all 40 of them: report the mean logit shift on *queried* attributes (should be large, correct sign) vs. *non-queried* attributes (should be ≈ 0). This directly quantifies whether the combiner learned the correlation structure — i.e. whether "+Blond_Hair" stops leaking into the gender logit — and is the per-method measure of the non-orthogonality problem the fixed rule cannot solve.
 
 ## 5. Likely failure cases and mitigations
 
@@ -128,7 +148,7 @@ Report all variants against the arithmetic baseline and the SVD-subspace method,
 | Weak identity proxy | Attribute agreement only approximates identity | CelebA has identity labels — measure top-K identity match; tighten proxy set or raise β if degraded |
 | Gate collapse (α → 0) | Query ≡ reference wins identity metrics while ignoring constraints | Monitor α's distribution; the lazy negative is the direct antidote |
 
-> **Key claim.** The single highest-leverage piece is the **violation negative**: it converts "T− as a vector to subtract" into "T− as a constraint to satisfy" — a distinction neither the arithmetic baseline nor the SVD-subspace method can express at all.
+> **Key claim.** The single highest-leverage piece is the **violation negative**: it converts "T− as a vector to subtract" into "T− as a constraint to satisfy" — a distinction no fixed composition rule (prompt arithmetic or probe-direction composition) can express at all.
 
 ## 6. References
 

@@ -6,7 +6,29 @@ the prompt text embeddings in the compose step: attribute directions learned
 where the database lives, no modality gap to cross.
 """
 
+from pathlib import Path
+
 import torch
+
+PROBE_FILE = "probe_weights.pt"
+
+
+def load_probes(repo_root: Path) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Load saved probes as (normalized directions, biases, attribute names).
+
+    Looks in results/ first, then features/ (the weights are a training
+    artifact, so either location is valid depending on how they were produced).
+    """
+    for folder in ("results", "features"):
+        path = repo_root / folder / PROBE_FILE
+        if path.is_file():
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            w = saved["weights"]
+            return w / w.norm(dim=1, keepdim=True), saved["biases"], saved["attributes"]
+    raise FileNotFoundError(
+        f"{PROBE_FILE} not found in {repo_root}/results or {repo_root}/features; "
+        "run scripts/fit_probes.py first."
+    )
 
 
 def fit_linear_probes(
