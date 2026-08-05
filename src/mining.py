@@ -68,7 +68,7 @@ class TripletMiner:
     ) -> None:
         if labels.shape[0] != features.shape[0]:
             raise ValueError("labels and features must describe the same images")
-        self.labels = labels.bool()
+        self.labels = labels.bool().to(features.device)
         self.features = features
         self.proxy_rows = proxy_rows
         self.min_candidates = min_candidates
@@ -76,7 +76,9 @@ class TripletMiner:
 
     def _satisfies(self, positives: list[int], negatives: list[int]) -> torch.Tensor:
         """Bool mask over the pool: has every T+ and lacks every T-."""
-        ok = torch.ones(self.labels.shape[0], dtype=torch.bool)
+        ok = torch.ones(
+            self.labels.shape[0], dtype=torch.bool, device=self.labels.device
+        )
         if positives:
             ok &= self.labels[:, positives].all(dim=1)
         if negatives:

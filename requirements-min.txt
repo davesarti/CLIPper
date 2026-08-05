@@ -1,0 +1,21 @@
+# Minimal top-level dependencies for Clipper.
+# Everything else (numpy, pillow, huggingface_hub, tokenizers, safetensors,
+# regex, requests, filelock, sympy, networkx, ...) is pulled in transitively.
+#
+# GPU note: install torch/torchvision FIRST with the index matching the VM's
+# CUDA driver, then run this file. e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# The pins below are CPU-friendly and will not override an existing install.
+
+torch>=2.4
+torchvision>=0.19
+transformers>=4.44
+pandas>=2.2
+tqdm>=4.66
+
+# tests
+pytest>=8.0
+
+# notebooks only (Project Skeleton.ipynb, baseline.ipynb) — drop on a headless VM
+matplotlib>=3.8
+jupyter>=1.1
