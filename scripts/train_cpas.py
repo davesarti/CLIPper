@@ -60,6 +60,9 @@ parser.add_argument("--delta-max", type=float, default=0.3,
                     help="bound on the direction bend; 0 leaves only rescaling")
 parser.add_argument("--no-cross-attention", action="store_true",
                     help="ablation: attribute tokens cannot see each other")
+parser.add_argument("--patience", type=int, default=15,
+                    help="stop after this many main-phase epochs without a val "
+                         "R@10 improvement; 0 disables early stopping")
 parser.add_argument("--seed", type=int, default=0, help="model init seed")
 parser.add_argument("--pool-features", type=Path, default=None,
                     help="feature file for the mining pool; default: full train "
@@ -127,35 +130,63 @@ model = CPAS(
 directions = directions.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-best = {"r10": -1.0, "state": None, "epoch": -1}
-triplets = None
-for epoch in range(args.warmup + args.epochs):
-    phase, ks = ("warmup", (1,)) if epoch < args.warmup else ("main", (1, 2, 3))
-    if triplets is None or epoch % args.remine_every == 0:
-        triplets = train_miner.sample_batch(args.triplets, ks=ks)
-
-    loss, proxy_r1 = run_epoch(
-        model, triplets, train_pool, directions,
-        optimizer=optimizer, batch_size=args.batch_size, device=device,
-    )
-    val_r10 = score_val_benchmark(model, val_pool, val_tasks, k=10)
-    print(f"epoch {epoch:3d} [{phase}]  loss {loss:.4f}  proxy r@1 {proxy_r1:.3f}  "
-          f"| val R@10 {val_r10:.4f}")
-    if val_r10 > best["r10"]:
-        best = {
-            "r10": val_r10,
-            "state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-            "epoch": epoch,
-        }
-
 out_path = args.out or REPO_ROOT / "results" / "cpas_model.pt"
 out_path.parent.mkdir(exist_ok=True)
-torch.save(
-    {"state_dict": best["state"], "attributes": attributes,
-     "val_r10": best["r10"], "epoch": best["epoch"],
-     "config": {"delta_max": args.delta_max,
-                "cross_attributes": not args.no_cross_attention},
-     "seed": args.seed},
-    out_path,
-)
+
+
+def save_checkpoint(best: dict) -> None:
+    """Write the best-so-far weights, atomically: a crash mid-write keeps the
+    previous checkpoint intact rather than truncating it."""
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    torch.save(
+        {"state_dict": best["state"], "attributes": attributes,
+         "val_r10": best["r10"], "epoch": best["epoch"],
+         "config": {"delta_max": args.delta_max,
+                    "cross_attributes": not args.no_cross_attention},
+         "seed": args.seed},
+        tmp,
+    )
+    tmp.replace(out_path)
+
+
+best = {"r10": -1.0, "state": None, "epoch": -1}
+triplets = None
+# Checkpointing on every improvement means an interrupted run (Ctrl-C, dropped
+# ssh, OOM) still leaves the best epoch on disk. Note this keeps the weights
+# only: no optimizer or RNG state, so a run can be kept but not resumed.
+try:
+    for epoch in range(args.warmup + args.epochs):
+        phase, ks = ("warmup", (1,)) if epoch < args.warmup else ("main", (1, 2, 3))
+        if triplets is None or epoch % args.remine_every == 0:
+            triplets = train_miner.sample_batch(args.triplets, ks=ks)
+
+        loss, proxy_r1 = run_epoch(
+            model, triplets, train_pool, directions,
+            optimizer=optimizer, batch_size=args.batch_size, device=device,
+        )
+        val_r10 = score_val_benchmark(model, val_pool, val_tasks, k=10)
+        print(f"epoch {epoch:3d} [{phase}]  loss {loss:.4f}  proxy r@1 {proxy_r1:.3f}  "
+              f"| val R@10 {val_r10:.4f}", flush=True)
+        if val_r10 > best["r10"]:
+            best = {
+                "r10": val_r10,
+                "state": {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()},
+                "epoch": epoch,
+            }
+            save_checkpoint(best)
+        # Warmup trains on a different (k=1 only) distribution, so its epochs
+        # never count against patience: the clock starts with the main phase.
+        elif args.patience and phase == "main":
+            stale = epoch - max(best["epoch"], args.warmup - 1)
+            if stale >= args.patience:
+                print(f"early stop: no val R@10 improvement in {stale} epochs "
+                      f"(best epoch {best['epoch']})")
+                break
+except KeyboardInterrupt:
+    print("\ninterrupted; keeping the best checkpoint so far")
+
+if best["state"] is None:
+    sys.exit("no epoch completed: nothing to save")
+save_checkpoint(best)
 print(f"\nBest epoch {best['epoch']} (val R@10 {best['r10']:.4f}) saved to {out_path}")
