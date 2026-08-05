@@ -21,6 +21,8 @@ import math
 import torch
 from torch import nn
 
+from src.steering import compose
+
 REF, POS, NEG = 0, 1, 2  # role-embedding rows
 
 
@@ -136,32 +138,4 @@ class CPAS(nn.Module):
     ) -> torch.Tensor:
         """Composite query embeddings, (B, D) L2-normalized."""
         gamma, alpha, delta = self.steer(v_ref, dirs, signs, mask)
-        bent = nn.functional.normalize(dirs + delta, dim=-1)
-        steps = (signs * alpha).unsqueeze(-1) * bent  # (B, K, D)
-        q = gamma.unsqueeze(-1) * v_ref + steps.sum(dim=1)
-        return nn.functional.normalize(q, dim=-1)
-
-
-def pad_queries(
-    queries: list[tuple[list[int], list[int]]],
-    directions: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack per-query attribute rows into padded (dirs, signs, mask) tensors.
-
-    queries: list of (positive rows, negative rows) indexing `directions`;
-    directions: (A, D) L2-normalized probe directions.
-    """
-    d = directions.shape[1]
-    k = max((len(p) + len(n) for p, n in queries), default=0)
-    dirs = torch.zeros(len(queries), k, d)
-    signs = torch.zeros(len(queries), k)
-    mask = torch.zeros(len(queries), k, dtype=torch.bool)
-    for i, (pos, neg) in enumerate(queries):
-        rows = pos + neg
-        if not rows:
-            continue
-        dirs[i, : len(rows)] = directions[rows]
-        signs[i, : len(pos)] = 1.0
-        signs[i, len(pos) : len(rows)] = -1.0
-        mask[i, : len(rows)] = True
-    return dirs, signs, mask
+        return compose(v_ref, dirs, signs, gamma, alpha, delta)

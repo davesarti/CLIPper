@@ -19,7 +19,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.cpas import CPAS, pad_queries
+from src.cpas import CPAS
+from src.steering import pad_queries
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import probe_drift, run_cpas_benchmark, run_probe_benchmark
 from src.features import ClipEncoder, load_or_extract

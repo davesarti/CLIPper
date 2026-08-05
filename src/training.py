@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from src.cpas import CPAS, pad_queries
+from src.steering import Steerer, pad_queries
 from src.mining import Triplet
 
 
@@ -87,7 +87,7 @@ def recall_at_1(q: torch.Tensor, batch: Batch) -> float:
 
 
 def run_epoch(
-    model: CPAS,
+    model: Steerer,
     triplets: list[Triplet],
     features: torch.Tensor,
     directions: torch.Tensor,

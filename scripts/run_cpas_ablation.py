@@ -19,7 +19,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.cpas import CPAS, pad_queries
+from src.cpas import CPAS
+from src.cpas_mlp import PerAttributeMLP
+from src.steering import pad_queries
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import probe_drift, run_cpas_benchmark, run_probe_benchmark
 from src.features import ClipEncoder, load_or_extract
@@ -83,7 +85,9 @@ rows.append(
 for spec in args.runs:
     name, _, path = spec.rpartition("=")  # variant names may contain "="
     checkpoint = torch.load(path, weights_only=True)
-    model = CPAS(**checkpoint.get("config", {}))
+    config = dict(checkpoint.get("config", {}))
+    arch = config.pop("arch", "cpas")  # pre---arch checkpoints are all CPAS
+    model = PerAttributeMLP(**config) if arch == "mlp" else CPAS(**config)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 

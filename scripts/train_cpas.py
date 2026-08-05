@@ -33,6 +33,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.cpas import CPAS
+from src.cpas_mlp import PerAttributeMLP
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import build_val_benchmark, score_val_benchmark
 from src.features import ClipEncoder
@@ -58,8 +59,17 @@ parser.add_argument("--val-per-query", type=int, default=200,
                     help="held-out references per query in the val R@10 benchmark")
 parser.add_argument("--delta-max", type=float, default=0.3,
                     help="bound on the direction bend; 0 leaves only rescaling")
-parser.add_argument("--no-cross-attention", action="store_true",
-                    help="ablation: attribute tokens cannot see each other")
+parser.add_argument("--arch", choices=("cpas", "mlp"), default="cpas",
+                    help="cpas: transformer encoder layer (2.4M params); "
+                         "mlp: per-attribute MLP + pooled context (0.50M)")
+parser.add_argument("--rank", type=int, default=32,
+                    help="rank of the delta factorization (--arch mlp only)")
+parser.add_argument("--no-cross-attributes", "--no-cross-attention",
+                    dest="no_cross_attributes", action="store_true",
+                    help="ablation: attributes cannot condition on each other "
+                         "(cpas: masks attribute-to-attribute attention; "
+                         "mlp: zeroes the pooled context). "
+                         "--no-cross-attention is a deprecated alias.")
 parser.add_argument("--patience", type=int, default=15,
                     help="stop after this many main-phase epochs without a val "
                          "R@10 improvement; 0 disables early stopping")
@@ -75,6 +85,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 paths = get_paths()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 slug = ClipEncoder.MODEL_NAME.split("/")[-1]
+
+
+def build_model(config: dict):
+    """Instantiate the architecture named by config["arch"].
+
+    Checkpoints written before --arch existed have no "arch" key and must keep
+    loading as CPAS, so the default is the transformer variant.
+    """
+    kwargs = dict(config)
+    arch = kwargs.pop("arch", "cpas")
+    return PerAttributeMLP(**kwargs) if arch == "mlp" else CPAS(**kwargs)
 
 
 def resolve_pool() -> Path:
@@ -124,9 +145,13 @@ val_tasks = build_val_benchmark(
 print(f"Val R@10 benchmark: {len(val_tasks)} queries, "
       f"{sum(t['refs'].shape[0] for t in val_tasks)} held-out references")
 
-model = CPAS(
-    delta_max=args.delta_max, cross_attributes=not args.no_cross_attention
-).to(device)
+config = {"arch": args.arch, "delta_max": args.delta_max,
+          "cross_attributes": not args.no_cross_attributes}
+if args.arch == "mlp":
+    config["rank"] = args.rank
+model = build_model(config).to(device)
+print(f"{args.arch}: {sum(p.numel() for p in model.parameters() if p.requires_grad):,} "
+      f"trainable parameters")
 directions = directions.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -141,8 +166,7 @@ def save_checkpoint(best: dict) -> None:
     torch.save(
         {"state_dict": best["state"], "attributes": attributes,
          "val_r10": best["r10"], "epoch": best["epoch"],
-         "config": {"delta_max": args.delta_max,
-                    "cross_attributes": not args.no_cross_attention},
+         "config": config,
          "seed": args.seed},
         tmp,
     )

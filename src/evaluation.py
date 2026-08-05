@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 
 from src.caption import encode_caption, flip_state, render_caption
-from src.cpas import CPAS, pad_queries
+from src.steering import Steerer, pad_queries
 from src.probes import compose_probe
 from src.retrieval import PROMPTS, compose, parse_query, rank
 
@@ -182,7 +182,7 @@ def build_val_benchmark(
 
 
 @torch.no_grad()
-def score_val_benchmark(model: CPAS, db: torch.Tensor, tasks: list[dict], k: int = 10) -> float:
+def score_val_benchmark(model: Steerer, db: torch.Tensor, tasks: list[dict], k: int = 10) -> float:
     """Mean Recall@k of `model` over a val benchmark from `build_val_benchmark`.
 
     db: (N, D) L2-normalized features of the val pool (the ranking database);
@@ -210,7 +210,7 @@ def score_val_benchmark(model: CPAS, db: torch.Tensor, tasks: list[dict], k: int
 def run_cpas_benchmark(
     annotations: list[dict],
     image_features: torch.Tensor,
-    model: CPAS,
+    model: Steerer,
     directions: torch.Tensor,
     attr_index: dict[str, int],
 ) -> pd.DataFrame:
