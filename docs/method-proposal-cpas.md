@@ -133,7 +133,7 @@ Each row adds one component; the deltas attribute the gain:
 
 Rows 2–4 are implemented as flags on the same model — `--delta-max` bounds the
 bend (0 freezes the directions) and `--no-cross-attention` masks
-attribute-to-attribute attention, keeping reference conditioning. Results in §7.
+attribute-to-attribute attention, keeping reference conditioning. Results in §6–7.
 
 Plus the **probe-drift diagnostic** (as in the SCAC doc): score `q` with all 40
 frozen probes and report mean logit shift on queried (large, correct sign) vs.
@@ -146,87 +146,74 @@ full test-split database, per query and MEAN (`run_cpas_benchmark` in
 `src/evaluation.py`). Model selection and early stopping use held-out references
 from the train pool, never the benchmark queries.
 
-## 6. First results
+## 6. Results
 
-Trained with `scripts/train_cpas.py` (20k mined triplets, 8 warm-up epochs on
-k = 1 then 25 on k ∈ {1,2,3}, Adam 1e-4, batch 256, ~17 min on CPU) and
-evaluated with `scripts/run_cpas_benchmark.py`. Checkpoint selected by
-validation batch recall@1 on the held-out image pool: epoch 13 of 33 — training
-recall keeps climbing to 0.77 afterwards while validation falls, so early
-stopping is load-bearing.
-
-MEAN over the 14 benchmark queries, full test-split database:
-
-| method | R@1 | R@5 | R@10 | P@10 |
-|---|---|---|---|---|
-| Probe composition (γ = 0.6) | 0.052 | 0.140 | 0.207 | 0.032 |
-| **CPAS** | **0.056** | **0.185** | **0.281** | **0.045** |
-
-+36% relative R@10 over the rule it was initialized from. The gain is
-concentrated at K = 5–10 rather than K = 1.
-
-**What the model learned**, read off the heads:
-
-- `γ` ranges 0.25–0.70 per query (mean 0.46) against the fixed 0.6 — it keeps
-  *more* reference for single-attribute edits like `+Male` (0.70) and much less
-  for compound ones like `+Chubby, -Young` (0.25).
-- `α` ranges 0.6–1.9 (mean 1.27), with the largest steps for the attributes CLIP
-  binds worst (`+Mustache` 1.81, `+Eyeglasses` 1.82) and steps below 1 for
-  removals (`-Heavy_Makeup` 0.61).
-- Probe drift: leakage into the 38 non-queried attributes drops from 0.084 to
-  0.050, so the edit is measurably cleaner — but the signed shift on the queried
-  attributes also drops (0.78 → 0.39), i.e. CPAS does not simply push the probe
-  logits harder.
-
-**Caveat on Δ.** With `δ_max = 0.3` per coordinate the bends are not small:
-`cos(ŵ_a + Δ_a, ŵ_a)` averages 0.49, a ~60° rotation, so the model is closer to
-*learning new reference-conditioned directions* than to correcting the probe
-ones — which also explains the reduced probe-logit shift.
-
-## 7. Ablations: what actually earns the gain
-
-Two seeds per variant, all trained on the same mined triplet pool
-(`scripts/train_cpas.py --triplet-cache`), all evaluated with
-`scripts/run_cpas_ablation.py`; MEAN over the 14 queries, seeds averaged:
+One run per variant (seed 0), trained with `scripts/train_cpas.py` on the full
+train-split mining pool — 40k triplets re-mined per epoch, 5 warm-up epochs on
+k = 1 then up to 45 on k ∈ {1,2,3}, Adam 1e-4, batch 1024, checkpoint selected by
+held-out val R@10. Evaluated with `scripts/run_cpas_ablation.py`; MEAN over the
+14 queries against the full test-split database. "Leakage" is the mean absolute
+probe drift on the 38 non-queried attributes.
 
 | variant | R@1 | R@5 | R@10 | leakage |
 |---|---|---|---|---|
 | Probe composition (γ = 0.6) | 0.052 | 0.140 | 0.207 | 0.084 |
-| CPAS, δ_max = 0 (γ and step sizes only) | 0.049 | 0.142 | 0.212 | 0.077 |
-| CPAS, δ_max = 0.1 | 0.061 | 0.181 | 0.270 | 0.052 |
-| **CPAS, δ_max = 0.3** | 0.062 | 0.188 | **0.277** | 0.050 |
-| CPAS, δ_max = 0.3, no cross-attention | 0.064 | 0.183 | 0.275 | 0.051 |
+| CPAS, δ_max = 0 (γ and step sizes only) | 0.045 | 0.127 | 0.191 | 0.059 |
+| CPAS, δ_max = 0.1 | 0.062 | 0.181 | 0.262 | 0.047 |
+| CPAS, δ_max = 0.3 | 0.066 | 0.185 | 0.259 | 0.047 |
+| **CPAS, δ_max = 0.3, no cross-attention** | 0.065 | 0.187 | **0.267** | 0.045 |
 
-Two findings, both against the original motivation:
+CPAS gains ~+0.06 R@10 (+29% relative) over the rule it was initialized from,
+concentrated at K = 5–10 rather than K = 1.
 
-1. **Learned γ and per-attribute step sizes are worth nothing.** Frozen
-   directions (δ_max = 0) score 0.212 against the fixed rule's 0.207 — inside
-   seed noise, despite γ and α varying substantially per query (§6). The entire
-   gain comes from **re-aiming the directions**, and it appears as soon as
-   bending is allowed at all (δ_max = 0.1 already gives 0.270). Future-work item
-   1 of `method-probe-direction-retrieval.md` (per-attribute step sizes) is
-   therefore not worth pursuing on its own.
-2. **Cross-attribute attention is not what fixes non-orthogonality.** Blocking
-   attribute-to-attribute attention costs nothing measurable: 0.275 vs 0.277
-   overall, and on the 6 multi-attribute queries — the only ones where the mask
-   changes anything — 0.295 vs 0.301, against a seed spread of 0.019 in the
-   masked variant itself. What the model needs is each direction re-aimed
-   *conditioned on the reference*; it does not need the directions to see each
-   other.
+## 7. What actually earns the gain
 
-The non-orthogonality problem is real (leakage into non-queried attributes drops
-from 0.084 to 0.050, and multi-attribute queries gain more than single-attribute
-ones: +0.098 vs +0.051 R@10), but the mechanism that solves it is
-reference-conditioned re-aiming, not attribute-attribute interaction.
+1. **Only re-aiming the directions matters.** With directions frozen
+   (δ_max = 0) the model scores *below* the fixed rule — 0.191 vs 0.207 —
+   despite learning γ and per-attribute steps that vary substantially per query.
+   Allowing any bend recovers the whole gain at once (δ_max = 0.1 already gives
+   0.262). Learned step sizes are not merely worthless, they cost accuracy;
+   future-work item 1 of `method-probe-direction-retrieval.md` (per-attribute
+   step sizes) is not worth pursuing on its own.
+2. **Cross-attribute attention is not what fixes non-orthogonality.** Masking
+   attribute-to-attribute attention costs nothing: 0.267 vs 0.259, with δ_max =
+   0.1/0.3/no-cross spanning only 0.008 against a measured seed spread of 0.019.
+   The three are indistinguishable at one seed. What the model needs is each
+   direction re-aimed *conditioned on the reference*, not the directions seeing
+   each other.
+3. **The gain is not just "smaller edits".** CPAS cuts leakage 0.084 → 0.045,
+   but also shrinks the shift on the *queried* attributes (0.78 → 0.36), so its
+   selectivity ratio is no better than the fixed rule's. Shrinking the fixed
+   rule's edit does not reproduce the result: in `results/probe_gamma_ablation.csv`
+   accuracy falls monotonically as the edit shrinks (γ = 0.9 → 0.189, γ = 1.5 →
+   0.145). At comparable edit magnitude the fixed rule scores ~0.14 and CPAS
+   0.26 — better retrieval from a *smaller* edit, which is re-aiming, not
+   rescaling. δ_max = 0 fits the same picture from the other side: it shrank the
+   step without being allowed to re-aim, and lost accuracy.
 
-**Consequences for the roadmap.** The attention layer can be replaced by a
-per-attribute conditioning MLP on `[v_ref ; ŵ_a ; sign]` at ~0.5 M parameters —
-simpler to explain, cheaper, and so far equally accurate; the attention result
-should be re-checked on a benchmark with more multi-attribute queries before
-being written off for good. It also weakens the case for SCAC's 2-layer
-transformer (`docs/method-proposal-scac.md` §2): on this evidence its expected
-gain would come from the violation-negative training signal, not the
-architecture.
+**Caveat on Δ.** At δ_max = 0.3, `cos(ŵ_a + Δ_a, ŵ_a)` averages 0.49 — a ~60°
+rotation. The model is closer to *learning new reference-conditioned directions*
+than to correcting the probe ones.
+
+### Future work
+
+- **Replace attention with a per-attribute conditioning MLP** on
+  `[v_ref ; ŵ_a ; sign]` (~0.5 M params): simpler, cheaper, equally accurate on
+  this evidence. Re-check on a benchmark with more multi-attribute queries
+  before writing attention off for good — only 6 of 14 queries exercise it.
+- **Run 4–5 seeds per variant** before claiming any ordering among δ_max = 0.1,
+  0.3 and no-cross. The seed spread (0.019) is larger than the gaps (0.008).
+- **Explain why heavier training did not help.** An earlier 2-seed run on the
+  30k mining pool scored higher across every variant (δ = 0.3: 0.277 vs 0.259).
+  Candidates: early stopping (`--patience 15`) truncating runs, or per-epoch
+  re-mining from the full pool destabilising the objective. Check the saved
+  `epoch` column first.
+- **Sweep δ_max between 0 and 0.1** — the entire effect appears inside that
+  interval and is currently unresolved.
+
+This weakens the case for SCAC's 2-layer transformer
+(`docs/method-proposal-scac.md` §2): on this evidence its expected gain would
+come from the violation-negative training signal, not the architecture.
 
 ## 8. Risks
 
