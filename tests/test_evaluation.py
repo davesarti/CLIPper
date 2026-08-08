@@ -1,6 +1,6 @@
 import torch
 
-from src.evaluation import evaluate_retrieval, run_benchmark, run_caption_benchmark
+from src.evaluation import evaluate_retrieval, run_benchmark
 
 
 def test_evaluate_retrieval_hit_at_1():
@@ -38,40 +38,3 @@ def test_run_benchmark_perfect_toy_setup():
     assert row["P@1"] == 1.0
     assert row["sources"] == 1
     assert "MEAN" in df["query"].values
-
-
-def test_run_caption_benchmark_perfect_toy_setup():
-    # 4 images, one-hot features; all reference states empty, so the query
-    # "+Smiling" renders "a smiling person" for every source.
-    image_features = torch.eye(4)
-    states = torch.zeros((4, 40), dtype=torch.bool)
-
-    # Fake text encoder: any smiling caption -> direction of image 1.
-    def encode_texts(prompts):
-        assert all("smiling" in p for p in prompts)
-        return torch.tensor([[0.0, 10.0, 0.0, 0.0]]).repeat(len(prompts), 1)
-
-    annotations = [{"query": "+Smiling", "ground_truth": {"0": [1]}}]
-
-    df = run_caption_benchmark(annotations, image_features, states, encode_texts)
-    row = df.loc[df["query"] == "+Smiling"].iloc[0]
-    assert row["R@1"] == 1.0
-    assert row["P@1"] == 1.0
-    assert row["sources"] == 1
-    assert "MEAN" in df["query"].values
-
-
-def test_run_caption_benchmark_encodes_each_caption_once():
-    # Two sources with identical states render the same caption; the text
-    # encoder must be called once, not per source.
-    image_features = torch.eye(4)
-    states = torch.zeros((4, 40), dtype=torch.bool)
-    calls = []
-
-    def encode_texts(prompts):
-        calls.append(prompts)
-        return torch.ones(len(prompts), 4) / 2
-
-    annotations = [{"query": "+Smiling", "ground_truth": {"0": [1], "2": [3]}}]
-    run_caption_benchmark(annotations, image_features, states, encode_texts)
-    assert len(calls) == 1

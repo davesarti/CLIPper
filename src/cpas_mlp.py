@@ -8,8 +8,9 @@ attribute independently plus a pooled context vector:
     c_a  = mean_{b != a} h1_b               what else is queried
     h_a  = MLP2([h1_a ; c_a])               -> alpha_a, delta_a
 
-The report's ablation found the cross-attention layer earned nothing measurable
-(0.008 against a 0.019 seed spread) while the full-rank delta head is the only
+The ablation of the earlier transformer variant (docs/method-history.md)
+found the cross-attention layer earned nothing measurable
+(0.007 against a 0.019 seed spread) while the full-rank delta head is the only
 component that earns the gain - and rotates the probe directions by ~60 degrees,
 which is more freedom than "correcting" them needs. This module acts on both:
 2.1M of trunk becomes 0.48M of MLP, and the 512x512 delta head becomes a

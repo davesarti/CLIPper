@@ -19,11 +19,15 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.cpas import CPAS
 from src.cpas_mlp import PerAttributeMLP
 from src.steering import pad_queries
 from src.data import get_paths, load_annotations, load_dataset
-from src.evaluation import probe_drift, run_cpas_benchmark, run_probe_benchmark
+from src.evaluation import (
+    negation_subset,
+    probe_drift,
+    run_cpas_benchmark,
+    run_probe_benchmark,
+)
 from src.features import ClipEncoder, load_or_extract
 from src.probes import compose_probe, load_probes
 from src.retrieval import parse_query
@@ -42,7 +46,8 @@ annotations = load_annotations(paths)
 features = load_or_extract(ClipEncoder(), celeba, paths.features_dir)
 directions, biases, attributes = load_probes(REPO_ROOT)
 attr_index = {name: i for i, name in enumerate(attributes)}
-metric_cols = ["R@1", "R@5", "R@10", "P@1", "P@5", "P@10"]
+metric_cols = ["R@1", "R@5", "R@10", "P@1", "P@5", "P@10", "V@10"]
+labels = celeba.attr.bool()  # test-split labels, for the violation rate
 
 
 @torch.no_grad()
@@ -74,11 +79,13 @@ def probe_queries(v_ref, pos_rows, neg_rows):
 
 rows = []
 probe_df = run_probe_benchmark(
-    annotations, features, directions, attr_index, gamma=BASELINE_GAMMA
+    annotations, features, directions, attr_index, gamma=BASELINE_GAMMA,
+    labels=labels,
 )
 rows.append(
     {"variant": f"probe composition (gamma={BASELINE_GAMMA})", "checkpoint": "-", "seed": -1}
     | probe_df[probe_df["query"] == "MEAN"].iloc[0][metric_cols].to_dict()
+    | {"neg_R@10": negation_subset(probe_df)}
     | drift_of(probe_queries)
 )
 
@@ -86,12 +93,13 @@ for spec in args.runs:
     name, _, path = spec.rpartition("=")  # variant names may contain "="
     checkpoint = torch.load(path, weights_only=True)
     config = dict(checkpoint.get("config", {}))
-    arch = config.pop("arch", "cpas")  # pre---arch checkpoints are all CPAS
-    model = PerAttributeMLP(**config) if arch == "mlp" else CPAS(**config)
+    config.pop("arch", None)  # older checkpoints tag the architecture
+    model = PerAttributeMLP(**config)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
-    df = run_cpas_benchmark(annotations, features, model, directions, attr_index)
+    df = run_cpas_benchmark(annotations, features, model, directions, attr_index,
+                            labels=labels)
     with torch.no_grad():
         drift = drift_of(lambda v, p, n: model(v, *pad_queries([(p, n)] * len(v), directions)))
     rows.append(
@@ -100,6 +108,10 @@ for spec in args.runs:
          "val_recall": checkpoint.get("val_r10", checkpoint.get("val_recall")),
          "epoch": checkpoint.get("epoch")}
         | df[df["query"] == "MEAN"].iloc[0][metric_cols].to_dict()
+        | {"neg_R@10": negation_subset(df)}
+        # The mining recipe distinguishes the negation-mining ablation rows,
+        # which are otherwise identical models.
+        | checkpoint.get("mining", {})
         | drift
     )
     print(f"{name:34s} seed {rows[-1]['seed']}  R@10 {rows[-1]['R@10']:.4f}")
@@ -110,7 +122,7 @@ out_dir.mkdir(exist_ok=True)
 table.to_csv(out_dir / "cpas_ablation.csv", index=False)
 
 summary = table.groupby("variant", sort=False)[
-    [*metric_cols, "queried", "non_queried_abs"]
+    [*metric_cols, "neg_R@10", "queried", "non_queried_abs"]
 ].mean()
 print("\nMEAN over the 14 queries, averaged over seeds:")
 print(summary.to_string(float_format=lambda x: f"{x:.4f}"))

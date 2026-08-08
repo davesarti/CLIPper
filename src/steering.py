@@ -1,11 +1,11 @@
-"""Pieces shared by the steered-composition combiners.
+"""Pieces shared by the steered-composition combiner and its call sites.
 
-Both combiners - CPAS (src/cpas.py) and PerAttributeMLP (src/cpas_mlp.py) -
-predict a reference weight, per-attribute step sizes and direction bends, then
-build the query with the same formula. That formula lives here once: the point
-of the ablation ladder in docs/method-proposal-cpas.md is that the variants
-differ only in how (gamma, alpha, delta) are produced, which is worth nothing if
-the composition can silently drift between them.
+The combiner (PerAttributeMLP, src/cpas_mlp.py) predicts a reference weight,
+per-attribute step sizes and direction bends, then builds the query from them.
+That formula lives here once, apart from the model: the ablations in
+docs/method-proposal-cpas.md only mean something if the variants differ solely
+in how (gamma, alpha, delta) are produced, which is worth nothing if the
+composition can silently drift between them.
 """
 
 from typing import Protocol
@@ -39,9 +39,9 @@ def compose(
 class Steerer(Protocol):
     """What training and evaluation actually require of a combiner.
 
-    Typing the call sites against this rather than against CPAS is what lets
-    scripts/train_cpas.py --arch swap the architecture with nothing downstream
-    to change.
+    Typing the call sites against this rather than against the concrete model
+    is what let the transformer variant be swapped out for cpas_mlp with
+    nothing downstream to change.
     """
 
     def steer(
@@ -61,6 +61,46 @@ class Steerer(Protocol):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         ...
+
+
+class FixedRule:
+    """The gamma-weighted probe composition, wearing the Steerer interface.
+
+    q = normalize(gamma * v_ref + sum(pos_dirs) - sum(neg_dirs)), i.e.
+    `probes.compose_probe` with alpha = 1 and delta = 0. Having it satisfy the
+    same protocol as the trained combiner is what lets the val benchmark and
+    the exclusion-rerank sweep run over both without a second code path.
+    """
+
+    def __init__(self, gamma: float = 0.6) -> None:
+        self.gamma = gamma
+
+    def eval(self) -> "FixedRule":
+        return self
+
+    def train(self, mode: bool = True) -> "FixedRule":
+        return self
+
+    def steer(
+        self,
+        v_ref: torch.Tensor,
+        dirs: torch.Tensor,
+        signs: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gamma = torch.full((v_ref.shape[0],), self.gamma, device=v_ref.device)
+        alpha = mask.to(dirs.dtype)
+        return gamma, alpha, torch.zeros_like(dirs)
+
+    def __call__(
+        self,
+        v_ref: torch.Tensor,
+        dirs: torch.Tensor,
+        signs: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        gamma, alpha, delta = self.steer(v_ref, dirs, signs, mask)
+        return compose(v_ref, dirs, signs, gamma, alpha, delta)
 
 
 def pad_queries(

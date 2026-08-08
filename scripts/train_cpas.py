@@ -32,12 +32,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.cpas import CPAS
 from src.cpas_mlp import PerAttributeMLP
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import build_val_benchmark, score_val_benchmark
 from src.features import ClipEncoder
-from src.mining import TripletMiner, proxy_rows
+from src.mining import TripletMiner, correlated_pairs, proxy_rows
 from src.probes import load_probes
 from src.retrieval import parse_query
 from src.training import run_epoch
@@ -59,17 +58,26 @@ parser.add_argument("--val-per-query", type=int, default=200,
                     help="held-out references per query in the val R@10 benchmark")
 parser.add_argument("--delta-max", type=float, default=0.3,
                     help="bound on the direction bend; 0 leaves only rescaling")
-parser.add_argument("--arch", choices=("cpas", "mlp"), default="cpas",
-                    help="cpas: transformer encoder layer (2.4M params); "
-                         "mlp: per-attribute MLP + pooled context (0.50M)")
 parser.add_argument("--rank", type=int, default=32,
-                    help="rank of the delta factorization (--arch mlp only)")
-parser.add_argument("--no-cross-attributes", "--no-cross-attention",
-                    dest="no_cross_attributes", action="store_true",
+                    help="rank of the delta factorization")
+parser.add_argument("--no-cross-attributes", dest="no_cross_attributes",
+                    action="store_true",
                     help="ablation: attributes cannot condition on each other "
-                         "(cpas: masks attribute-to-attribute attention; "
-                         "mlp: zeroes the pooled context). "
-                         "--no-cross-attention is a deprecated alias.")
+                         "(zeroes the pooled context)")
+parser.add_argument("--neg-fraction", type=float, default=None,
+                    help="target share of flips that are negations; default "
+                         "(None) keeps uniform sampling, where only ~23%% of "
+                         "flips end up being negations")
+parser.add_argument("--n-violations", type=int, default=1,
+                    help="near misses mined per triplet")
+parser.add_argument("--lambda-violation", type=float, default=0.0,
+                    help="weight of the separate violation loss; 0 leaves the "
+                         "violations inside the main InfoNCE softmax")
+parser.add_argument("--correlated-pair-prob", type=float, default=0.0,
+                    help="probability of drawing the flip set from correlated "
+                         "attribute pairs put in tension")
+parser.add_argument("--correlation-threshold", type=float, default=0.3,
+                    help="minimum |label correlation| for that pair table")
 parser.add_argument("--patience", type=int, default=15,
                     help="stop after this many main-phase epochs without a val "
                          "R@10 improvement; 0 disables early stopping")
@@ -85,17 +93,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 paths = get_paths()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 slug = ClipEncoder.MODEL_NAME.split("/")[-1]
-
-
-def build_model(config: dict):
-    """Instantiate the architecture named by config["arch"].
-
-    Checkpoints written before --arch existed have no "arch" key and must keep
-    loading as CPAS, so the default is the transformer variant.
-    """
-    kwargs = dict(config)
-    arch = kwargs.pop("arch", "cpas")
-    return PerAttributeMLP(**kwargs) if arch == "mlp" else CPAS(**kwargs)
 
 
 def resolve_pool() -> Path:
@@ -129,7 +126,19 @@ pools = {"train": perm[:split], "val": perm[split:]}
 rows = proxy_rows(attributes)
 train_pool = features[pools["train"]].to(device)
 val_pool = features[pools["val"]].to(device)
-train_miner = TripletMiner(labels[pools["train"]], train_pool, rows, seed=args.seed)
+pairs = (
+    correlated_pairs(labels[pools["train"]], threshold=args.correlation_threshold)
+    if args.correlated_pair_prob else []
+)
+if pairs:
+    print(f"Correlated-pair table: {len(pairs)} pairs at "
+          f"|corr| > {args.correlation_threshold}, drawn with probability "
+          f"{args.correlated_pair_prob}")
+train_miner = TripletMiner(
+    labels[pools["train"]], train_pool, rows, seed=args.seed,
+    neg_fraction=args.neg_fraction, n_violations=args.n_violations,
+    pairs=pairs, pair_prob=args.correlated_pair_prob,
+)
 
 # Held-out val benchmark, built once (ground truth does not depend on the model).
 annotations = load_annotations(paths)
@@ -145,12 +154,10 @@ val_tasks = build_val_benchmark(
 print(f"Val R@10 benchmark: {len(val_tasks)} queries, "
       f"{sum(t['refs'].shape[0] for t in val_tasks)} held-out references")
 
-config = {"arch": args.arch, "delta_max": args.delta_max,
+config = {"delta_max": args.delta_max, "rank": args.rank,
           "cross_attributes": not args.no_cross_attributes}
-if args.arch == "mlp":
-    config["rank"] = args.rank
-model = build_model(config).to(device)
-print(f"{args.arch}: {sum(p.numel() for p in model.parameters() if p.requires_grad):,} "
+model = PerAttributeMLP(**config).to(device)
+print(f"CPAS-MLP: {sum(p.numel() for p in model.parameters() if p.requires_grad):,} "
       f"trainable parameters")
 directions = directions.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -167,6 +174,12 @@ def save_checkpoint(best: dict) -> None:
         {"state_dict": best["state"], "attributes": attributes,
          "val_r10": best["r10"], "epoch": best["epoch"],
          "config": config,
+         # The mining/loss recipe is not recoverable from the weights, and the
+         # negation-mining ablation rows differ only in these four numbers.
+         "mining": {"neg_fraction": args.neg_fraction,
+                    "n_violations": args.n_violations,
+                    "lambda_violation": args.lambda_violation,
+                    "correlated_pair_prob": args.correlated_pair_prob},
          "seed": args.seed},
         tmp,
     )
@@ -182,11 +195,18 @@ try:
     for epoch in range(args.warmup + args.epochs):
         phase, ks = ("warmup", (1,)) if epoch < args.warmup else ("main", (1, 2, 3))
         if triplets is None or epoch % args.remine_every == 0:
+            train_miner.stats = dict.fromkeys(train_miner.stats, 0)
             triplets = train_miner.sample_batch(args.triplets, ks=ks)
+            stats = train_miner.summary()
+            print(f"  mining: rejection {stats['rejection_rate']:.3f} "
+                  f"(too few candidates {stats['too_few_candidates']:.3f}, "
+                  f"no violation {stats['no_violation']:.3f})  "
+                  f"negation share {stats['negation_share']:.3f}", flush=True)
 
         loss, proxy_r1 = run_epoch(
             model, triplets, train_pool, directions,
             optimizer=optimizer, batch_size=args.batch_size, device=device,
+            lambda_violation=args.lambda_violation,
         )
         val_r10 = score_val_benchmark(model, val_pool, val_tasks, k=10)
         print(f"epoch {epoch:3d} [{phase}]  loss {loss:.4f}  proxy r@1 {proxy_r1:.3f}  "

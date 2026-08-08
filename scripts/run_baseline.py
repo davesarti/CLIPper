@@ -5,8 +5,7 @@ First run takes ~30-60 min on CPU for feature extraction; later runs load
 the cache and finish in seconds.
 
 Pass --num-samples/-n to restrict the image pool to the first N images of
-the test split (for comparison against a matching-size attribute-caption
-run); omit it to use the full split.
+the test split; omit it to use the full split.
 """
 
 import argparse

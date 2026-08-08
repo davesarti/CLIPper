@@ -1,13 +1,11 @@
 import pytest
 import torch
 
-from src.cpas import CPAS
 from src.cpas_mlp import PerAttributeMLP
 from src.probes import compose_probe
 from src.steering import compose, pad_queries
 
 ARCHITECTURES = [
-    pytest.param(lambda **kw: CPAS(d=16, heads=2, ffn=32, **kw), id="cpas"),
     pytest.param(
         lambda **kw: PerAttributeMLP(d=16, hidden=8, sign_dim=4, rank=4, **kw),
         id="mlp",
