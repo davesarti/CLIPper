@@ -7,7 +7,7 @@
 | Dataset | CelebA (40 binary attributes); test split as fixed retrieval database |
 | Encoder | Frozen CLIP ViT-B/32, d = 512; features pre-computed once |
 | Attribute representation | Signed **probe directions** `ŵ_a` (frozen linear-probe weights, `results/probe_weights.pt`) |
-| Trainable | ≈ 2.4 M parameters (one transformer encoder layer + three small heads) |
+| Trainable | ≈ 2.4 M parameters (one transformer encoder layer + three small heads); 0.50 M for the MLP variant of §6.2 |
 | Position in roadmap | Between probe-direction composition (fixed rule, current best) and SCAC (full learned combiner, `docs/method-proposal-scac.md`) |
 
 ## 0. Problem setup
@@ -148,6 +148,8 @@ from the train pool, never the benchmark queries.
 
 ## 6. Results
 
+### 6.1 First campaign: the δ_max ablation
+
 One run per variant (seed 0), trained with `scripts/train_cpas.py` on the full
 train-split mining pool — 40k triplets re-mined per epoch, 5 warm-up epochs on
 k = 1 then up to 45 on k ∈ {1,2,3}, Adam 1e-4, batch 1024, checkpoint selected by
@@ -166,6 +168,36 @@ probe drift on the 38 non-queried attributes.
 CPAS gains ~+0.06 R@10 (+29% relative) over the rule it was initialized from,
 concentrated at K = 5–10 rather than K = 1.
 
+### 6.2 Second campaign: CPAS-MLP and seed variance
+
+Run on a different machine (Tesla T4) with probes refit from a different 30k
+train-split sample — `scripts/extract_train_features.py` reproduces the cached
+features that `fit_probes.py` and `train_cpas.py` require but neither produces.
+Refit probe directions align with the originals at cosine > 0.96, not exactly, so
+**absolute numbers are not directly comparable across campaigns**. Every ablation
+run recomputes the fixed-rule row with the same probes as the models it is
+scored against, which makes the **Δ over the fixed rule** the comparable
+quantity: the rule lands at 0.210 here against 0.207 in §6.1.
+
+CPAS-MLP is `src/cpas_mlp.py`: the encoder layer replaced by a per-attribute MLP
+over `[v_ref ; ŵ_a ; sign]` plus a pooled context, and the 512×512 Δ head
+factorized to rank 32. Same composition, same baseline initialization, same
+hyperparameters, full mining pool.
+
+| variant | pool | seeds | R@1 | R@5 | R@10 | Δ over rule | leakage | params |
+|---|---|---|---|---|---|---|---|---|
+| Probe composition (γ = 0.6) | — | — | 0.051 | 0.144 | 0.210 | — | 0.095 | 0 |
+| **CPAS-MLP, δ_max = 0.3** | full | 3 | 0.066 | 0.182 | **0.267** | **+0.057** | 0.061 | 0.50 M |
+| CPAS, δ_max = 0.3 | 30k | 1 | 0.064 | 0.195 | 0.283 | +0.073 | 0.052 | 2.4 M |
+| CPAS, δ_max = 0.3 (§6.1) | full | 1 | 0.066 | 0.185 | 0.259 | +0.052 | 0.047 | 2.4 M |
+
+Per-seed R@10 for CPAS-MLP: 0.2677 / 0.2689 / 0.2644 — **σ = 0.0023, range
+0.0045**, selected epochs 30 / 35 / 31. The val benchmark ranks the three seeds
+in the same order as the test benchmark (3 of 3), which it could not be checked
+to do in §6.1: on the full pool the held-out database holds 16,277 images,
+close to the 19,962 of the test split, whereas a 30k pool leaves only 3,000 and
+inflates val R@10 without tracking it better.
+
 ## 7. What actually earns the gain
 
 1. **Only re-aiming the directions matters.** With directions frozen
@@ -177,10 +209,18 @@ concentrated at K = 5–10 rather than K = 1.
    step sizes) is not worth pursuing on its own.
 2. **Cross-attribute attention is not what fixes non-orthogonality.** Masking
    attribute-to-attribute attention costs nothing: 0.267 vs 0.259, with δ_max =
-   0.1/0.3/no-cross spanning only 0.008 against a measured seed spread of 0.019.
-   The three are indistinguishable at one seed. What the model needs is each
-   direction re-aimed *conditioned on the reference*, not the directions seeing
-   each other.
+   0.1/0.3/no-cross spanning only 0.008. What the model needs is each direction
+   re-aimed *conditioned on the reference*, not the directions seeing each
+   other. §6.2 settles this by removing the attention layer outright: CPAS-MLP
+   reaches Δ +0.057 over the fixed rule against the transformer's +0.052 on the
+   same pool, with **4.8× fewer parameters** — equal or better, never worse.
+   The self-attention trunk is not earning its cost on this benchmark.
+
+   The seed spread that made §6.1 inconclusive was also overstated. Three seeds
+   of CPAS-MLP on the full pool give σ = 0.0023 and a range of 0.0045, not the
+   0.019 assumed here — so gaps of 0.008 *are* resolvable. The measurement is
+   scoped to this variant and pool and may not transfer to the δ_max ladder,
+   which remains unreplicated.
 3. **The gain is not just "smaller edits".** CPAS cuts leakage 0.084 → 0.045,
    but also shrinks the shift on the *queried* attributes (0.78 → 0.36), so its
    selectivity ratio is no better than the fixed rule's. Shrinking the fixed
@@ -190,30 +230,64 @@ concentrated at K = 5–10 rather than K = 1.
    0.26 — better retrieval from a *smaller* edit, which is re-aiming, not
    rescaling. δ_max = 0 fits the same picture from the other side: it shrank the
    step without being allowed to re-aim, and lost accuracy.
+4. **The mining pool moves the score more than the architecture does.** The
+   same transformer scores 0.283 on the 30k pool and 0.259 on the full one
+   (Δ +0.073 vs +0.052) — a larger effect than any architectural variant
+   measured so far, and in the counter-intuitive direction: *less* mining data,
+   better retrieval. Since CPAS-MLP is not worse than the transformer at equal
+   pool (§6.2), the 30k advantage cannot be attributed to the architecture.
+   The likely mechanism is the `min_candidates = 20` rejection in
+   `src/mining.py`: on a 27k training pool a flip combination must reach 0.067%
+   prevalence to be trainable, on 146k only 0.012%, so the small pool trains
+   almost exclusively on frequent attributes — which is what the 14 benchmark
+   queries are made of. Re-mining every epoch from a much larger pool also
+   makes the objective non-stationary. Both remain hypotheses: the 2×2 is
+   incomplete without CPAS-MLP on the 30k pool.
 
 **Caveat on Δ.** At δ_max = 0.3, `cos(ŵ_a + Δ_a, ŵ_a)` averages 0.49 — a ~60°
 rotation. The model is closer to *learning new reference-conditioned directions*
 than to correcting the probe ones.
 
+**Selectivity, again.** §6.2 reproduces point 3 on a second architecture: the
+ratio of queried shift to leakage is 8.24 for the fixed rule, 8.07 for CPAS-MLP
+and 7.52 for the transformer. No variant is more selective than the rule it
+started from; they retrieve better from a smaller, better-aimed edit. Note the
+MLP edits harder than the transformer (0.492 vs 0.393) for nearly the same
+score — the transformer finds a cheaper edit, not a more effective one.
+
 ### Future work
 
-- **Replace attention with a per-attribute conditioning MLP** on
-  `[v_ref ; ŵ_a ; sign]` (~0.5 M params): simpler, cheaper, equally accurate on
-  this evidence. Re-check on a benchmark with more multi-attribute queries
-  before writing attention off for good — only 6 of 14 queries exercise it.
-- **Run 4–5 seeds per variant** before claiming any ordering among δ_max = 0.1,
-  0.3 and no-cross. The seed spread (0.019) is larger than the gaps (0.008).
-- **Explain why heavier training did not help.** An earlier 2-seed run on the
-  30k mining pool scored higher across every variant (δ = 0.3: 0.277 vs 0.259).
-  Candidates: early stopping (`--patience 15`) truncating runs, or per-epoch
-  re-mining from the full pool destabilising the objective. Check the saved
-  `epoch` column first.
+*Done in §6.2:* replace attention with a per-attribute conditioning MLP
+(implemented as `src/cpas_mlp.py`, 0.50 M params — equal or better at equal
+pool); run multiple seeds (3, σ = 0.0023). The caveat on the first item stands:
+only **6 of 14** benchmark queries have k ≥ 2, so attention is barely exercised
+and should be re-checked on a benchmark with more multi-attribute queries before
+being written off for good.
+
+- **Complete the 2×2**: CPAS-MLP on the 30k pool, 3 seeds. Three cells are
+  filled (§6.2); the fourth decides whether the pool effect holds across
+  architectures. Cheap — mining cost scales with pool size, so a 30k run takes
+  ~40 min against ~2h15 on the full pool.
+- **Test the rarity-threshold hypothesis directly** by comparing the frequency
+  distribution of the attribute combinations actually sampled from the two
+  pools, rather than inferring it from the scores.
+- **Replicate the δ_max ladder with 3 seeds.** The measured spread (0.0045) now
+  makes its 0.008 gaps resolvable, but the ladder itself is still one seed per
+  rung.
 - **Sweep δ_max between 0 and 0.1** — the entire effect appears inside that
   interval and is currently unresolved.
+- **Re-run the transformer and the MLP with identical probes** on one machine.
+  Every cross-campaign comparison here goes through the Δ-over-rule column
+  because the two campaigns used different probe refits; a single-machine
+  replication would remove the need for it.
 
 This weakens the case for SCAC's 2-layer transformer
-(`docs/method-proposal-scac.md` §2): on this evidence its expected gain would
-come from the violation-negative training signal, not the architecture.
+(`docs/method-proposal-scac.md` §2), and §6.2 weakens it further: a model with
+no attention at all matches the single-layer transformer at 1/4.8 the
+parameters, so a two-layer trunk has nothing in these results to justify it.
+On this evidence SCAC's expected gain lies entirely in the violation-negative
+training signal and the λ re-rank term — the parts that treat negation as an
+exclusion constraint — not in the architecture.
 
 ## 8. Risks
 
@@ -221,4 +295,4 @@ come from the violation-negative training signal, not the architecture.
 |---|---|
 | Mining noise: targets are proxies ("another person with the right attributes") | identity-proxy agreement + CLIP-similarity tie-break; monitor identity-distractor loss term |
 | Rare attributes/combos have few candidate targets | rejection sampling with a minimum-candidate threshold; report per-attribute results |
-| Overfitting the small benchmark | never train or select on it; the 2.4 M model consumes frozen features only |
+| Overfitting the small benchmark | never train or select on it; the 2.4 M (or 0.50 M) model consumes frozen features only |
