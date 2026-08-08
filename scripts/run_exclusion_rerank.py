@@ -79,17 +79,26 @@ attr_index = {name: i for i, name in enumerate(attributes)}
 
 # The saved biases belong to the raw weights, so pairing them with the
 # normalized directions yields meaningless probabilities. Confirm the raw pair
-# reproduces the AUC in results/probe_accuracy.csv before trusting db_probs.
-valid = torch.load(paths.features_dir / f"{ClipEncoder.MODEL_NAME.split('/')[-1]}_valid.pt",
-                   weights_only=True)
-valid_features = valid["features"] if isinstance(valid, dict) else valid
-valid_labels = load_dataset(paths, split="valid").attr.bool()
-if isinstance(valid, dict):
-    valid_labels = valid_labels[valid["indices"]]
+# separates a known attribute before trusting db_probs. Preferred surface is
+# the valid split, so the number is comparable to results/probe_accuracy.csv;
+# the test split is also held out from probe fitting, so it is a sound fallback
+# on a machine that never extracted the valid features.
+valid_path = paths.features_dir / f"{ClipEncoder.MODEL_NAME.split('/')[-1]}_valid.pt"
+if valid_path.is_file():
+    valid = torch.load(valid_path, weights_only=True)
+    check_features = valid["features"] if isinstance(valid, dict) else valid
+    check_labels = load_dataset(paths, split="valid").attr.bool()
+    if isinstance(valid, dict):
+        check_labels = check_labels[valid["indices"]]
+    check_split = "valid"
+else:
+    check_features, check_labels, check_split = features, test_labels, "test"
+    print(f"{valid_path.name} not found; running the probe check on the test "
+          f"split instead (also held out from probe fitting)")
 check_row = attr_index["Male"]
-check_auc = roc_auc(valid_features @ raw_weights[check_row] + raw_biases[check_row],
-                    valid_labels[:, check_row])
-print(f"Sanity check - Male probe valid AUC from the raw weights: {check_auc:.4f}")
+check_auc = roc_auc(check_features @ raw_weights[check_row] + raw_biases[check_row],
+                    check_labels[:, check_row])
+print(f"Sanity check - Male probe {check_split} AUC from the raw weights: {check_auc:.4f}")
 if check_auc < 0.9:
     sys.exit("raw probe weights do not reproduce the reported AUC; wrong tensors loaded")
 
