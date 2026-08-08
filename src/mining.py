@@ -6,7 +6,7 @@ T+, 1->0 gives T-), then look up a real image that satisfies the flipped
 constraints and still looks like the same kind of person.
 
 Each example also carries the three hard negatives of the proposal
-(docs/method-proposal-cpas.md, S3), each aimed at one shortcut:
+(docs/method.md S5.1), each aimed at one shortcut:
 
     violation  - satisfies T+ but breaks a T- (or misses a T+ when the query
                  has no negatives): negation is a constraint, not a direction
@@ -77,7 +77,7 @@ class TripletMiner:
             sampling makes a flip a negation only when the reference already
             has the attribute, so at CelebA's mean prevalence of 0.226 roughly
             77% of trained edits are additions
-            (docs/method-proposal-negation-mining.md S2.1). None keeps that.
+            (docs/method.md S6.2). None keeps that.
         n_violations: near misses mined per triplet (S2.2).
         pairs / pair_prob: with probability `pair_prob`, draw the flip set from
             `pairs` - correlated attributes put in tension, one added and one
@@ -198,7 +198,7 @@ class TripletMiner:
 
         Returns up to `n_violations` indices, most similar to the reference
         first. One arbitrary near miss gives the exclusion signal nothing to
-        generalize from (docs/method-proposal-negation-mining.md S2.2).
+        generalize from (docs/method.md S6.2).
         """
         if negatives:
             bad = self.labels[:, negatives].any(dim=1)
@@ -311,7 +311,7 @@ def correlated_pairs(
     nearly independent. The queries that break the model pair correlated ones -
     Wearing_Lipstick and Heavy_Makeup correlate at +0.80, so adding one while
     removing the other asks for a region that is both small and hard to
-    separate (docs/method-proposal-negation-mining.md S2.4).
+    separate (docs/method.md S6.2).
 
     labels: (N, A) bool; computed once from the train split.
     """

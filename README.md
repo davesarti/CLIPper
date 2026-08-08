@@ -9,9 +9,17 @@ one. CLIP ViT-B/32 stays frozen throughout; only the query embedding is built.
   `q = normalize(v_ref + Σt⁺ − Σt⁻)`. No training.
 - **Current method**: CPAS-MLP — the same composition over learned *probe* directions,
   with the reference weight, per-attribute step size and direction bend predicted per
-  query by a 0.50 M-parameter MLP. See `docs/method-proposal-cpas.md`.
-- **How we got there**, including the methods that were tried and dropped:
-  `docs/method-history.md`.
+  query by a 0.50 M-parameter MLP; optionally scored with a non-compensatory hinge
+  penalty on constraint violations.
+
+Two documents, kept deliberately apart:
+
+- **`docs/method.md`** — the current pipeline and nothing else: probes, composition,
+  the combiner, negation-aware mining, the exclusion re-rank, the evaluation protocol,
+  current results, and what is still open. **Start here.**
+- **`docs/method-history.md`** — how the method was arrived at, and what was tried and
+  dropped (prompt arithmetic, attribute captions, the transformer combiner, SCAC).
+  Read it for *why* the design is what it is.
 
 ## Layout
 
@@ -24,8 +32,10 @@ one. CLIP ViT-B/32 stays frozen throughout; only the query embedding is built.
 - `scripts/` — `smoke_test.py`, `run_baseline.py`, `extract_train_features.py`,
   `fit_probes.py`, `run_probe_accuracy.py`, `run_probe_gamma_ablation.py`,
   `train_cpas.py`, `run_cpas_ablation.py`, `run_exclusion_rerank.py`
-- `docs/` — method proposals and history
-- `results/` — benchmark CSVs and the trained checkpoint
+- `docs/` — `method.md` (the current pipeline) and `method-history.md` (what was tried
+  and dropped, and why)
+- `results/` — benchmark CSVs and probe weights; `results/archive/` holds output from
+  abandoned approaches (nothing reads it)
 - `tests/` — 95 pytest tests, model-free
 
 ## Setup
@@ -75,9 +85,13 @@ MEAN over the 14 benchmark queries, full test-split database:
 | Probe-direction composition (γ = 0.6) | 0.051 | 0.144 | 0.210 |
 | **CPAS-MLP** | 0.066 | 0.182 | **0.267** |
 
+With the exclusion re-rank on, R@10 moves within noise (+0.01) but the **top-10
+violation rate falls from 0.40 to 0.26** on CPAS-MLP and 0.35 to 0.17 on the fixed
+rule. Full table, ablations and caveats in `docs/method.md` §9.
+
 Per-query tables in `results/`. Absolute numbers shift slightly with the probe refit, so
 compare against the fixed-rule row recomputed by the same run — see
-`docs/method-proposal-cpas.md` §3.
+`docs/method.md` §8.
 
 ## Gotchas
 

@@ -70,7 +70,7 @@ def test_multi_attribute_queries_use_the_context():
 
 def test_delta_is_low_rank():
     """The bend is confined to a rank-r subspace - the regularizer on the one
-    component docs/method-proposal-cpas.md flags as over-free (cos = 0.49)."""
+    component docs/method.md flags as over-free (cos = 0.49)."""
     model = _trained_like(PerAttributeMLP(d=16, hidden=8, sign_dim=4, rank=4))
     assert model.delta_up.weight.shape == (16, 4)
     assert torch.linalg.matrix_rank(model.delta_up.weight) <= 4

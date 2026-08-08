@@ -3,7 +3,7 @@
 The combiner (PerAttributeMLP, src/cpas_mlp.py) predicts a reference weight,
 per-attribute step sizes and direction bends, then builds the query from them.
 That formula lives here once, apart from the model: the ablations in
-docs/method-proposal-cpas.md only mean something if the variants differ solely
+docs/method.md only mean something if the variants differ solely
 in how (gamma, alpha, delta) are produced, which is worth nothing if the
 composition can silently drift between them.
 """

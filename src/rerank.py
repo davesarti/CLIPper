@@ -4,7 +4,7 @@ A single query vector scores every candidate with one linear functional, and a
 linear functional is compensatory: `q.d` is a weighted sum of attribute
 evidence, so a surplus on one attribute pays for a violation on another. The
 ground truth is conjunctive. This module adds a hinge penalty on top of the
-cosine term (docs/method-proposal-exclusion-rerank.md):
+cosine term (docs/method.md S7):
 
     s(d) = q.d
            - lam_neg * sum_{a in T-} relu( p_a(d) - tau_a )

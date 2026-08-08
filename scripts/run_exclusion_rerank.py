@@ -1,4 +1,4 @@
-"""Tune and evaluate the exclusion re-rank (docs/method-proposal-exclusion-rerank.md).
+"""Tune and evaluate the exclusion re-rank (docs/method.md S7).
 
 Three stages, in this order:
 

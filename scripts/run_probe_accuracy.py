@@ -9,9 +9,9 @@ Current result: macro-mean valid AUC 0.929 (0.731 Oval_Face to 0.999 Male),
 macro-mean AP 0.746. The attributes appearing in the evaluation benchmark all
 score AUC 0.909 or better.
 
-Probe quality lives in this file. results/attribute_accuracy.csv is a leftover
-of the zero-shot text-prompt method (see docs/method-history.md) and measures
-prompt classification instead.
+Probe quality lives in this file. The similarly named attribute_accuracy.csv
+under results/archive/ belongs to the abandoned zero-shot text-prompt method and
+measures prompt classification instead; do not read probe quality out of it.
 
 Reads only cached features; the test split is never loaded. Takes a couple of
 minutes on CPU, nearly all of it the 2000-step probe fit.

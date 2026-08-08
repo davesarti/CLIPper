@@ -3,7 +3,7 @@
 The query built from (reference, flips) must rank its mined target above every
 other image in the batch and above the three hard negatives mined with it
 (violation / identity distractor / lazy), which is the InfoNCE objective of
-docs/method-proposal-cpas.md S3.
+docs/method.md S5.
 """
 
 from dataclasses import dataclass
@@ -110,7 +110,7 @@ def violation_loss(
     gradient only when it already ranks near the top: the term meant to teach
     "negation is a constraint" is roughly one thousandth of the loss mass. Here
     the sum runs over M items, so each violation carries real gradient
-    (docs/method-proposal-negation-mining.md S2.3).
+    (docs/method.md S6.2).
 
     q, targets: (B, D) L2-normalized; violations: (B, M, D).
     """

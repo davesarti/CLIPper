@@ -1,6 +1,6 @@
 """CPAS-MLP: per-attribute conditioning without a transformer.
 
-Same composition as CPAS (docs/method-proposal-cpas.md), same three learned
+Same composition as CPAS (docs/method.md), same three learned
 quantities, but the encoder layer is replaced by an MLP applied to each
 attribute independently plus a pooled context vector:
 
@@ -8,7 +8,7 @@ attribute independently plus a pooled context vector:
     c_a  = mean_{b != a} h1_b               what else is queried
     h_a  = MLP2([h1_a ; c_a])               -> alpha_a, delta_a
 
-The ablation of the earlier transformer variant (docs/method-history.md)
+The ablation of the earlier transformer variant (docs/method.md S11)
 found the cross-attention layer earned nothing measurable
 (0.007 against a 0.019 seed spread) while the full-rank delta head is the only
 component that earns the gain - and rotates the probe directions by ~60 degrees,

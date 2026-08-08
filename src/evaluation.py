@@ -43,7 +43,7 @@ def violation_rate(
     This is what the exclusion penalty directly targets, and R@k cannot stand in
     for it: R@k can improve for reasons unrelated to exclusion, so a rise in
     R@k without a fall here leaves the mechanism claim unsupported
-    (docs/method-proposal-exclusion-rerank.md S4).
+    (docs/method.md S8).
 
     order: (S, N) retrieved indices, best first; labels: (N, A) bool.
     """
@@ -62,7 +62,7 @@ def negation_subset(df: pd.DataFrame, column: str = "R@10") -> float:
 
     The overall mean is diluted by the positive-only queries that the
     negation-aware changes are not meant to help - 6 of the 14 - so the subset
-    is reported separately (docs/method-proposal-negation-mining.md S4).
+    is reported separately (docs/method.md S8).
     """
     rows = df[(df["query"] != "MEAN") & df["query"].str.contains("-")]
     return float(rows[column].mean()) if len(rows) else float("nan")
@@ -341,7 +341,7 @@ def probe_drift(
     `queried` is signed so that positive means "moved the right way" (+ for T+
     attributes, - for T-); `non_queried_abs` is leakage into the attributes the
     query never mentioned, which non-orthogonal directions cause and a
-    conditioned composition should shrink (docs/method-proposal-cpas.md S4).
+    conditioned composition should shrink (docs/method.md S8).
     """
     shift = (query_vecs - v_ref) @ weights.T  # biases cancel
     queried = pos_rows + neg_rows

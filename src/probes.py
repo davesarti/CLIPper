@@ -14,9 +14,9 @@ the top of the ranking is clean. `Wearing_Necklace` scores 0.826 AUC but 0.372
 AP at a 12% positive rate.
 
 `scripts/run_probe_accuracy.py` writes these numbers to
-`results/probe_accuracy.csv`. The separate `results/attribute_accuracy.csv` is
-a leftover of the zero-shot text-prompt method (see `docs/method-history.md`)
-and measures prompt classification, not probes.
+`results/probe_accuracy.csv`. The similarly named `attribute_accuracy.csv` under
+`results/archive/` belongs to the abandoned zero-shot text-prompt method and
+measures prompt classification, not probes.
 """
 
 from pathlib import Path
