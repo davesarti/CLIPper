@@ -123,6 +123,8 @@ def run_benchmark(
     image_features: torch.Tensor,
     encode_texts: Callable[[list[str]], torch.Tensor],
     gamma: float = 1.0,
+    labels: torch.Tensor | None = None,
+    attr_index: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """Evaluate the compose+rank baseline on every query in `annotations`.
 
@@ -131,7 +133,14 @@ def run_benchmark(
     encode_texts: maps a list of prompt strings to (M, D) L2-normalized
         embeddings (injected so tests can fake it and the model loads once).
     gamma: reference-image weight passed through to compose.
+    labels / attr_index: optional (N, A) bool test-split labels and the
+        attribute-name -> column map, which add the top-10 violation rate to
+        the table. Both or neither; with neither the table is what it always
+        was. The baseline is scored exactly like every other method
+        (docs/method.md S8 rule 1), so its row is comparable column for column.
     """
+    if (labels is None) != (attr_index is None):
+        raise ValueError("labels and attr_index must be given together")
     rows = []
     for entry in annotations:
         positives, negatives = parse_query(entry["query"])
@@ -139,6 +148,8 @@ def run_benchmark(
             else torch.zeros((0, image_features.shape[1]))
         neg_texts = encode_texts([PROMPTS[a] for a in negatives]) if negatives \
             else torch.zeros((0, image_features.shape[1]))
+        pos_rows = [attr_index[a] for a in positives] if attr_index else None
+        neg_rows = [attr_index[a] for a in negatives] if attr_index else None
 
         source_indices = [int(k) for k in entry["ground_truth"].keys()]
         query_vecs = torch.stack([
@@ -146,7 +157,8 @@ def run_benchmark(
             for i in source_indices
         ])
         order = rank(query_vecs, image_features, exclude=source_indices)
-        rows.append(_query_row(entry, order, source_indices))
+        rows.append(_query_row(entry, order, source_indices, labels,
+                               pos_rows, neg_rows))
 
     return _with_mean_row(rows)
 
