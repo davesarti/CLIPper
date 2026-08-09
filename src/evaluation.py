@@ -13,6 +13,12 @@ from src.retrieval import PROMPTS, compose, parse_query, rank
 KS = (1, 5, 10)
 VIOLATION_K = 10
 
+# Assignment S3.1.1: a target is valid ground truth iff it strictly satisfies the
+# query's constraints AND its remaining attributes are within this Hamming
+# distance of the reference's. Verified against celeba_evaluation.json by exact
+# set reconstruction on all 33,052 (query, reference) pairs.
+MAX_HAMMING = 2
+
 
 def evaluate_retrieval(
     retrieved_indices: list[int],
@@ -189,24 +195,29 @@ def run_probe_benchmark(
 def build_val_benchmark(
     labels: torch.Tensor,
     query_specs: list[tuple[list[int], list[int]]],
-    proxy_rows: list[int],
     directions: torch.Tensor,
     per_query: int = 200,
     min_gt: int = 3,
     seed: int = 0,
+    max_hamming: int = MAX_HAMMING,
 ) -> list[dict]:
     """Held-out replica of the eval benchmark for checkpoint selection.
 
-    Mirrors how the real celeba_evaluation.json ground truth is built - images
-    that satisfy the query constraints and match the reference on the identity-
-    proxy attributes - but over a held-out image pool (the val split), so it
-    tracks the true R@10 without ever touching the test references or the test
-    ground truth. Only the query *shapes* are shared with the benchmark, which
-    is exactly the distribution we are graded on.
+    Reproduces the assignment's ground-truth rule exactly (S3.1.1: constraints
+    satisfied, plus Hamming distance <= 2 to the reference over the non-queried
+    attributes) but over a held-out image pool, so it tracks the true R@10
+    without ever touching the test references or the test ground truth. Only the
+    query *shapes* are shared with the benchmark, which is the distribution we
+    are graded on.
+
+    An earlier version required exact agreement on ten identity-proxy
+    attributes. That is a different task: it selected checkpoints and tuned
+    hyperparameters against ground truth the benchmark does not use, which is
+    why validation gains did not transfer to test.
 
     labels: (N, A) bool for the val pool (references and database are this pool);
     query_specs: (positive rows, negative rows) per query, indexing `labels`;
-    proxy_rows: identity-proxy attribute rows; directions: (A, D) probe dirs.
+    directions: (A, D) probe dirs.
     Returns one task dict per query with precomputed reference indices, a
     (R, N) ground-truth mask, and the padded (dirs, signs, mask) model inputs.
     """
@@ -219,18 +230,16 @@ def build_val_benchmark(
             satisfies &= labels[:, pos_rows].all(dim=1)
         if neg_rows:
             satisfies &= ~labels[:, neg_rows].any(dim=1)
-        # A queried attribute must differ from the reference by construction, so
-        # it cannot be part of the identity match (mirrors mining target choice).
+        # The queried attributes differ from the reference by construction, so
+        # they are excluded from the distance, exactly as in S3.1.1.
         queried = set(pos_rows) | set(neg_rows)
-        prox = [r for r in proxy_rows if r not in queried]
+        others = [a for a in range(labels.shape[1]) if a not in queried]
+        rest = labels[:, others]
 
         refs, masks = [], []
         for r in torch.randperm(n, generator=gen).tolist():
-            if prox:
-                agree = (labels[:, prox] == labels[r, prox]).all(dim=1)
-            else:
-                agree = torch.ones(n, dtype=torch.bool)
-            gt = satisfies & agree
+            close = (rest != rest[r]).sum(dim=1) <= max_hamming
+            gt = satisfies & close
             gt[r] = False
             if int(gt.sum()) >= min_gt:
                 refs.append(r)

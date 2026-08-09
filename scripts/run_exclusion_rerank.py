@@ -38,7 +38,6 @@ from src.evaluation import (
     score_val_benchmark,
 )
 from src.features import ClipEncoder, load_or_extract
-from src.mining import proxy_rows
 from src.probes import load_probes, load_raw_probes, roc_auc
 from src.rerank import Rerank, database_probe_probs
 from src.retrieval import parse_query
@@ -153,7 +152,7 @@ query_specs = [
     for e in annotations
 ]
 val_tasks = build_val_benchmark(
-    val_labels, query_specs, proxy_rows(attributes), directions,
+    val_labels, query_specs, directions,
     per_query=args.val_per_query, seed=args.seed,
 )
 val_probs = database_probe_probs(val_pool, raw_weights, raw_biases)

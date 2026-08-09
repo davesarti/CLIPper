@@ -109,9 +109,6 @@ for spec in args.runs:
          "epoch": checkpoint.get("epoch")}
         | df[df["query"] == "MEAN"].iloc[0][metric_cols].to_dict()
         | {"neg_R@10": negation_subset(df)}
-        # The mining recipe distinguishes the negation-mining ablation rows,
-        # which are otherwise identical models.
-        | checkpoint.get("mining", {})
         | drift
     )
     print(f"{name:34s} seed {rows[-1]['seed']}  R@10 {rows[-1]['R@10']:.4f}")

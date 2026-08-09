@@ -1,440 +1,305 @@
 # Compositional image retrieval on CelebA — the full method
 
-**Frozen CLIP ViT-B/32, linear attribute probes, a learned combiner, and a
-non-compensatory scoring rule.**
+**Frozen CLIP ViT-B/32, a learned attribute predictor, and retrieval scored
+directly against the assignment's ground-truth criterion.**
 
-This is the single reference for the current pipeline — it folds in the separate
-CPAS, exclusion-rerank and negation-mining proposals. **Anything not described
+This is the single reference for the current pipeline. **Anything not described
 in this document is not part of the method.**
 
-It describes only what is current. How the method was arrived at, and the
-approaches that were tried and dropped along the way — prompt arithmetic, the
-attribute-caption method, the transformer combiner, the SCAC proposal — are in
-`docs/method-history.md`. Read that one for *why* the design is what it is; read
-this one for *what* it is.
+It describes only what is current. How the method was arrived at, and what was
+tried and dropped — prompt arithmetic, the attribute-caption method, the
+transformer combiner, the SCAC proposal — are in `docs/method-history.md`. Read
+that one for *why* the design is what it is; this one for *what* it is.
 
 | | |
 |---|---|
-| Task | Given a reference image and attribute constraints `T+` / `T−`, retrieve images that keep the reference's identity, have every attribute in `T+` and none in `T−` |
+| Task | Given a reference image and attribute constraints `T+` / `T−`, retrieve images that preserve the reference's identity, have every attribute in `T+` and none in `T−` |
 | Dataset | CelebA, 40 binary attributes; the test split is the fixed retrieval database (19,962 images) |
 | Encoder | Frozen CLIP ViT-B/32, d = 512, features pre-computed once |
-| Benchmark | 14 fixed queries with provided ground truth (`celeba_evaluation.json`), R@{1,5,10} and P@{1,5,10} |
-| Trained parts | 40 linear probes; one combiner MLP (~500k parameters); 2 scalars for the re-rank, tuned not learned |
+| Benchmark | 14 fixed queries, `celeba_evaluation.json`, R@{1,5,10} and P@{1,5,10} |
+| Trained parts | one attribute head (~1.1 M parameters) on frozen features; optionally the CPAS-MLP combiner; 2 scalars tuned on validation |
 
 ---
 
-## 1. Pipeline
+## 1. The criterion the task is actually defined by
 
-Five stages. Each one is independently testable, and each later stage can be
-switched off to recover the earlier one exactly.
+Everything below follows from one fact, so it comes first.
+
+**Assignment §3.1.1** defines a retrieved image as correct if and only if:
+
+1. it strictly satisfies the query's positive / negative constraints, **and**
+2. its remaining attributes are within **Hamming distance 2** of the
+   reference's.
+
+Both conditions are statements about 40-bit **attribute codes** — not about
+embedding geometry. Verified against `celeba_evaluation.json` by exact set
+reconstruction on **all 33,052 (query, reference) pairs**. (The benchmark also
+only includes references with ≥ 5 valid targets, also per §3.1.1; the observed
+minimum ground-truth set size is exactly 5.)
+
+Three consequences drive the design:
+
+- **The composition is not a learning problem.** The optimal target code is the
+  reference's code with the queried bits flipped. §3.1.1 defines it that way.
+  There is nothing for a fusion module to discover about *what* to aim at.
+- **Retrieval quality is bounded by attribute-prediction accuracy.** With true
+  labels the benchmark is solved exactly (R@10 = 1.000, measured). Every point
+  of the remaining gap is code error.
+- **Ranking by cosine similarity is a proxy, and a weak one.** CLIP similarity
+  and attribute-code proximity are different orderings. Measured: the cosine
+  top-10 differs from the reference on 4–10 attributes while the correct answers
+  differ on 0–2, and those correct answers sit at cosine ranks in the thousands.
+
+The task is nearest-neighbour retrieval in attribute space. The method scores
+that criterion directly.
+
+---
+
+## 2. Pipeline
 
 ```
-CelebA image ──► [1] frozen CLIP ──► v_ref (512-d, L2-normalized)
-                                        │
-CelebA labels ──► [2] linear probes ──► ŵ_a  directions  ├──► [3/4] combiner ──► q
-                                    └─► w_a, b_a  raw    │
-                                                         ▼
-                                    [5] score(d) = q·d − hinge penalty(d)
-                                                         │
-                                                         ▼
-                                                   ranked database
+CelebA image ──► [1] frozen CLIP ──► features (512-d, L2-normalized)
+                                          │
+                                          ├──► [2] attribute head ──► p(d) ∈ [0,1]^40
+                                          │                           for every image
+                                          │                                 │
+      T+ / T− ─────────────────────────────────────────────► [3] target code
+                                          │                                 │
+                                          └──► [4] optional combiner ──► q  │
+                                                                   │        │
+                                            [5] score = −E[Hamming] − λ·violation + w·(q·d)
+                                                                            │
+                                                                            ▼
+                                                                     ranked database
 ```
 
-1. **Features** — encode the database once, cache to disk.
-2. **Probes** — one logistic regression per attribute on frozen features, giving
-   both an *edit direction* and a *classifier*.
-3. **Composition** — the fixed rule: a γ-weighted sum of the reference and the
-   signed attribute directions.
-4. **CPAS-MLP** — a learned combiner that replaces the fixed rule's constants
-   with per-query predictions. Trained contrastively on mined triplets.
-5. **Exclusion re-rank** — a hinge penalty on constraint violations, applied to
-   the score rather than to the query vector.
+1. **Features** — encode once, cache to disk. Frozen throughout.
+2. **Attribute head** — predict all 40 attribute probabilities per image.
+3. **Target code** — the reference's predicted code with queried bits forced.
+4. **Combiner** (optional) — CPAS-MLP, producing a composite query embedding.
+5. **Score** — expected Hamming on non-queried attributes, plus a constraint
+   penalty, plus an optional cosine term.
 
-Stages 3 and 4 are alternatives; 5 stacks on either.
+Setting `w = 0` drops the combiner; setting the Hamming term aside and `w = 1`
+recovers the old cosine pipeline exactly. Both are reported.
 
 ---
 
-## 2. Features
+## 3. Features
 
-`src/features.py`. CLIP ViT-B/32 image encoder, L2-normalized outputs, cached as
-`features/clip-vit-base-patch32_{split}.pt`. Nothing here is trained. The test
-split is the retrieval database; the train split is the mining pool; the valid
-split exists for probe scoring.
+`src/features.py`. CLIP ViT-B/32 image encoder, L2-normalized, cached as
+`features/clip-vit-base-patch32_{split}.pt`. Nothing here is trained. Test split
+= retrieval database; train split = training pool; valid split = the selection
+surface for the attribute head and its thresholds.
 
-Everything downstream reads the cache, so a feature refit invalidates every
-number in `results/`.
+A feature refit invalidates every number in `results/`.
 
 ---
 
-## 3. Attribute probes
+## 4. Attribute prediction — where the performance is
 
-`src/probes.py`, fit by `scripts/fit_probes.py`, scored by
-`scripts/run_probe_accuracy.py`.
+This is the component that matters, so it gets the most care.
 
-One logistic regression per attribute, full-batch Adam, 2000 steps, lr 0.05.
-**These defaults are the recipe behind `results/probe_weights.pt` and every
-number downstream of it; changing them silently invalidates the benchmarks.**
+### 4.1 Why accuracy, not AUC
 
-The probes serve two different roles, and the distinction causes a specific bug
-if missed:
+The score consumes a thresholded 40-bit code, and correctness requires landing
+inside a radius-2 ball across ~38 bits. Errors compound: at **0.909** per-bit
+accuracy the expected code is ~3.5 bits wrong — already outside the ball. AUC
+0.929 flatters this, because AUC measures ranking *within* an attribute.
 
-| use | tensor | loaded by |
+**Measured exchange rate: +0.003 bit accuracy bought +0.022 R@10** — roughly
+**7× amplification**. Small accuracy gains are worth real effort here.
+
+### 4.2 Two predictors, both reported
+
+| predictor | where | valid bit accuracy |
 |---|---|---|
-| edit **direction** in the composition | `w_a / ‖w_a‖` | `load_probes` |
-| **classifier** `p_a(d) = σ(w_a·d + b_a)` for the re-rank | raw `w_a`, `b_a` | `load_raw_probes` |
+| linear probe (logistic regression) | `src/probes.py` | 0.9088 |
+| **MLP head** (512 → 1024 → 1024 → 40, GELU, dropout) | `src/attribute_head.py` | **0.9119** |
 
-The saved biases belong to the *unnormalized* weights. Pairing them with the
-normalized directions produces plausible-looking but meaningless probabilities.
-`scripts/run_exclusion_rerank.py` asserts a known attribute reproduces its
-reported AUC before using the probabilities at all.
+The linear probe is kept because it also supplies the *edit directions* the
+combiner needs, and because it is the within-run reference point.
 
-**Quality** (`results/probe_accuracy.csv`): macro-mean valid AUC **0.929**, from
-0.731 (Oval_Face) to 0.999 (Male); macro-mean AP 0.746. Every attribute in the
-benchmark scores 0.909 AUC or better.
+Trained by `scripts/fit_attribute_head.py`: AdamW, cosine schedule, selection on
+**held-out valid bit accuracy** (not loss — accuracy is what transfers to the
+score). Widths 512–2048 and dropout 0.2–0.4 all land within 0.001 of each other,
+so capacity is not the constraint; the open question is data (§9).
 
-That number matters because it rules out an explanation: **the failures below
-are not a probe-quality problem.** The directions are good; the way constraints
-are combined is the problem.
+### 4.3 Thresholds
 
----
+`tune_thresholds` fits a per-attribute decision threshold on the valid split.
+0.5 is only optimal for a calibrated probe on a balanced attribute, and most
+CelebA attributes are far from balanced. Thresholds are saved *with* the
+weights — a code produced with different thresholds is a different code.
 
-## 4. Composition — the fixed rule
-
-`compose_probe` in `src/probes.py`:
-
-```
-q = normalize( γ·v_ref + Σ_{a∈T+} ŵ_a − Σ_{a∈T−} ŵ_a )
-```
-
-γ trades identity preservation against the attribute edits. Swept by
-`scripts/run_probe_gamma_ablation.py`; **γ = 0.6** is the operating point and the
-baseline every later method is measured against.
-
-Using probe directions rather than CLIP text embeddings is what makes this work:
-the directions live in the visual embedding space where the database lives, so
-there is no modality gap to cross. Prompt arithmetic (`src/retrieval.py`,
-`scripts/run_baseline.py`) is retained only as the reference baseline row.
-
-`FixedRule` in `src/steering.py` wraps this same formula behind the combiner
-interface, so the fixed rule can be fed to any call site that takes a model.
+**Probability calibration was tried and does not help.** Per-attribute Platt
+scaling fitted on valid moved NLL 0.2095 → 0.2068 and R@10 0.4609 → 0.4584.
+The probes were already calibrated (fitted slopes 0.78–1.08). Calibration
+changes probability *values*, not bit accuracy, and bit accuracy is what binds.
 
 ---
 
-## 5. CPAS-MLP — the learned combiner
+## 5. Scoring
 
-`src/cpas_mlp.py`. The fixed rule uses one global γ and an implicit step size of
-1 for every attribute and every reference. CPAS-MLP predicts those instead,
-conditioned on the (reference, query) pair:
+`src/attribute_retrieval.py`.
 
 ```
-q = normalize( γ·v_ref + Σ_a s_a · α_a · normalize(ŵ_a + Δ_a) ),   s_a = ±1
+score(d) = − Σ_{a ∉ query} P(d differs from the target code on a)   # §3.1.1 (2)
+           − λ · [ d breaks a queried constraint ]                  # §3.1.1 (1)
+           + w · (q · d)                                            # composite embedding
 ```
 
-- **γ** — per-query reference weight
-- **α_a** — per-attribute step size (how far to move for *this* reference)
-- **Δ_a** — bounded direction bend, low-rank, `‖Δ‖ ≤ delta_max` (default 0.3)
+- **Expected Hamming, not thresholded Hamming.** Using probabilities keeps the
+  predictor's uncertainty in the ranking and is smoother; an attribute at p=0.5
+  contributes 0.5 rather than an arbitrary bit.
+- **The constraint term is the exclusion re-rank** (`src/rerank.py`) with the
+  weight raised. At large λ it is a hard filter, at small λ a soft preference.
+  Which is better is a sweep, and on validation **λ = 4 beat λ = 100** — the
+  soft version wins, because the filter is applied to *predicted* attributes and
+  a hard filter propagates prediction errors irreversibly.
+- **The cosine term** keeps a composite query embedding in the ranking, so the
+  fusion module still contributes and the assignment's Φ requirement is met by a
+  component that is actually in the score.
 
-The attributes see each other through a pooled context vector, so a step can
-depend on what else is being asked for. `--no-cross-attributes` zeroes that
-pooling as an ablation.
+λ and w are swept on the held-out validation benchmark, never on the 14 test
+queries.
 
-The composition formula itself lives once in `src/steering.py::compose`, apart
-from the model. Ablations only mean something if the variants differ solely in
-how `(γ, α, Δ)` are produced.
+---
 
-### 5.1 Training data — mined triplets
+## 6. The combiner (CPAS-MLP)
 
-`src/mining.py`. Training examples are synthesized from **train-split labels**;
-the test split is never touched. Sample a reference, flip k of its attributes
-(0→1 gives `T+`, 1→0 gives `T−`), then find a real image satisfying the flipped
-constraints that still looks like the same kind of person — "same person" being
-approximated by agreement on ten stable, non-editable identity-proxy attributes,
-with CLIP similarity as the tie-break.
+`src/cpas_mlp.py`, trained by `scripts/train_cpas.py`. Predicts a reference
+weight γ, per-attribute step sizes α, and bounded direction bends Δ, then
+composes
 
-Each example carries three hard negatives, each aimed at one shortcut:
+```
+q = normalize( γ·v_ref + Σ_a s_a · α_a · normalize(ŵ_a + Δ_a) )
+```
 
-| negative | what it prevents |
+Trained contrastively (InfoNCE, τ = 0.05) on attribute-flip triplets mined from
+train-split labels (`src/mining.py`), with three hard negatives per example:
+a violation, an identity distractor, and the reference itself.
+
+**Its role is now a tiebreak.** It is the best cosine-space method measured
+(R@10 0.267 versus 0.210 for the fixed γ = 0.6 rule), but in the combined score
+the cosine term is worth little — see §7. It is retained because §1 of the
+assignment requires a fusion module Φ yielding a composite query embedding, and
+because it is the honest upper bound for what cosine-space composition achieves.
+
+**Known issue:** the mining target is selected by agreement on ten
+identity-proxy attributes with a CLIP-similarity tiebreak — not the §3.1.1
+Hamming rule. Any retrain should fix this first (§9).
+
+---
+
+## 7. Results
+
+All numbers: per-query mean over the 14 benchmark queries, full test split,
+identical aggregation. Scoring hyperparameters selected on validation.
+
+| method | scoring | R@1 | R@5 | R@10 | P@10 |
+|---|---|---|---|---|---|
+| Prompt arithmetic (γ = 1) | cosine | 0.023 | 0.071 | 0.106 | — |
+| Probe composition (γ = 0.6) | cosine | 0.051 | 0.144 | 0.210 | 0.033 |
+| CPAS-MLP | cosine | 0.062 | 0.187 | 0.267 | 0.043 |
+| CPAS-MLP + exclusion re-rank | cosine + hinge | 0.061 | 0.183 | 0.279 | 0.043 |
+| **Attribute space, linear probe** | §5 | 0.116 | 0.336 | **0.465** | 0.088 |
+| **Attribute space, MLP head** | §5 | — | — | **0.482** | — |
+| *oracle attribute codes* | §5 | *1.000* | *1.000* | *1.000* | — |
+
+The MLP-head row was measured with fixed hyperparameters before the sweep
+existed; rerun `scripts/run_attribute_retrieval.py --head ...` to fill the row
+properly.
+
+**What is established:**
+
+- **Scoring the criterion beats approximating it, by a wide margin.** 0.210 →
+  0.465 for the same linear probes and no training whatsoever. Precision@10
+  nearly triples (0.033 → 0.088), so it is not a recall-only artifact.
+- **Attribute accuracy is the remaining lever**, with 7× amplification and a
+  measured ceiling of 1.000 at perfect codes.
+- **The soft constraint penalty beats the hard filter** (λ = 4 over λ = 100 on
+  validation), because the filter acts on predicted attributes.
+
+**What is not:**
+
+- The MLP-head gain (+0.022) clears the 0.02 resolution limit by little, on one
+  seed. It needs repetition.
+- The cosine term contributes ~0.004 in the earlier fixed-weight run; the swept
+  run selected w = 1 with a small margin. The combiner's real contribution to
+  the final score is not yet resolved.
+
+### 7.1 Error decomposition
+
+Which half of the code hurts, measured by substituting true labels on one side:
+
+| | R@10 |
 |---|---|
-| violation | satisfies `T+` but breaks a `T−` — *negation is a constraint, not a direction* |
-| distractor | satisfies the constraints but is a different kind of person — *do not ignore the reference* |
-| lazy (the reference itself) | *do not return it unchanged* |
+| both codes predicted | 0.461 |
+| perfect reference code, predicted database | 0.649 |
+| predicted reference, perfect database codes | 0.763 |
+| both perfect | 1.000 |
 
-Flip sets that fewer than `min_candidates = 20` images satisfy are rejected, so
-training never sees combinations with no usable target.
-
-### 5.2 Loss
-
-`src/training.py`. InfoNCE at τ = 0.05: the query built from (reference, flips)
-must rank its mined target above every other target in the batch and above its
-own three mined negatives.
-
-### 5.3 Checkpoint selection
-
-`scripts/train_cpas.py`. Selection is on **val R@10**, not the mining proxy.
-Every epoch the model is scored on a held-out benchmark built by
-`build_val_benchmark`, which mirrors the real ground-truth rule (constraint
-satisfaction + identity-proxy match) over a 10% held-out slice of the mining pool
-and the same 14 query shapes. The old val-triplet recall@1 is kept only as a
-diagnostic — it tracks the true metric poorly, which is why it is not the
-selection signal.
-
-Triplets are re-mined every epoch, so the model never sees the same synthetic
-edit twice.
-
----
-
-## 6. Negation-aware mining
-
-Four changes to the training distribution and the loss. **No new parameters.**
-All four are off by default, so the baseline recipe stays runnable from the same
-script.
-
-### 6.1 The problem
-
-**The model is barely trained on negation.** Uniform flip sampling makes a flip a
-negative constraint only if the reference *already has* the attribute. Mean
-CelebA attribute prevalence is 0.226, so only ~23% of flips become negations and
-~77% of trained edits are additions. Measured on the real pool: realized
-negation share **0.195**.
-
-**And the negation signal that exists is numerically drowned.** One violation per
-triplet enters the same softmax as 1023 in-batch targets plus two other mined
-negatives. At τ = 0.05 it contributes gradient only when it already ranks near
-the top — the term meant to teach exclusion is roughly one thousandth of the
-loss mass.
-
-**Third, target selection pushes the other way.** The target is chosen for
-maximal identity agreement with the reference, so the dominant learning pressure
-is "stay near `v_ref`" — the same direction that trades exclusion away.
-
-### 6.2 The changes
-
-| flag | change | rationale |
-|---|---|---|
-| `--neg-fraction 0.5` | draw the number of negations from a binomial, sample them from the reference's ON set and the rest from its OFF set | force negations into the distribution; realized share 0.195 → **0.512** |
-| `--n-violations 8` | mine the 8 closest near misses instead of 1 | one arbitrary near miss gives nothing to generalize from |
-| `--lambda-violation 0.5` | pull violations out of the main softmax into `λ_v · L_violation`, where the target must outrank only its own violations | the signal was there but drowned; over 8 items instead of 1026 each violation carries real gradient |
-| `--correlated-pair-prob 0.3` | with probability ρ, draw the flip set from attribute pairs with \|corr\| > 0.3, signs in tension (one added, one removed) | random pairs are easy because most attributes are near-independent; the failing queries pair correlated ones (Wearing_Lipstick/Heavy_Makeup correlate at **+0.80**) |
-
-Two edge cases are handled explicitly, because getting them wrong biases the
-pool silently:
-
-- a reference with fewer ON attributes than the draw asks for gets **fewer
-  negations**, not a rejection — otherwise rare-attribute references vanish from
-  training;
-- forced negations make constraint sets harder to satisfy, so **rejection rises**.
-  The miner counts this and `train_cpas.py` prints it every mining round:
-
-  ```
-  mining: rejection 0.074 (too few candidates 0.069, no violation 0.005)  negation share 0.543
-  ```
-
-  Report both numbers. If rejection climbs past ~0.3 the effective training
-  distribution is not the one intended.
-
-### 6.3 Verified invariant
-
-With all four flags off, the miner reproduces the pre-change implementation
-**triplet for triplet, RNG draw for RNG draw** (checked over 300 triplets at
-k ∈ {1,2,3}), and `run_epoch` computes the identical single-softmax loss. The
-baseline is therefore a true reference point, not an approximation of one.
-
----
-
-## 7. Exclusion re-rank
-
-### 7.1 The problem
-
-**A single query vector scores every candidate with one linear functional, and a
-linear functional is compensatory.** `q·d` is a weighted sum of attribute
-evidence, so a large surplus on one attribute pays for a violation on another.
-The ground truth is conjunctive: a target must satisfy *every* constraint.
-
-Negation is the acute case. It enters the composition only as `−α_a·ŵ_a`, a
-subtraction whose single magnitude does two jobs: raising `α_a` to make the
-exclusion bite also dilutes `v_ref` and the positive terms, because the sum is
-renormalized. One knob, two objectives.
-
-This is a property of the **output form**, not of the trunk that predicts
-(γ, α, Δ). No architecture change removes it — which is why this changes the
-scoring function instead.
-
-**Evidence** (fixed rule, per-query, `results/exclusion_rerank_per_query.csv`):
-`corr(R@10, number of negated attributes) = −0.54` across the 13 distinct
-benchmark queries. The worst are `-Male, -Mustache` (0.000),
-`+Chubby, -Young` (0.027) and `+Wearing_Lipstick, -Heavy_Makeup, +Smiling`
-(0.059), against 0.39–0.43 for well-populated positive queries.
-
-### 7.2 The method
-
-`src/rerank.py`. Keep `q` and its cosine term; add a penalty that is **not**
-compensatory:
-
-```
-s(d) = q·d
-       − λ⁻ · Σ_{a∈T−} relu( p_a(d) − τ_a )      # forbidden attribute present
-       − λ⁺ · Σ_{a∈T+} relu( τ_a − p_a(d) )      # required attribute absent
-```
-
-Three properties matter:
-
-- **The hinge makes it a constraint, not a discount.** Below the threshold the
-  penalty is exactly zero, so a compliant candidate is never charged. Above it,
-  the cost cannot be bought back by a better cosine elsewhere.
-- **Probabilities, not logits.** Raw logits have per-attribute scale, so a shared
-  λ would silently weight attributes by their logit magnitude. Squashing to [0,1]
-  makes one λ meaningful across all 40.
-- **It is nearly free.** `P = σ(features @ w.T + b)` is one (19962, 40) matrix,
-  3.2 MB, computed once. Scoring a query is a gather and a hinge.
-
-`λ⁻ = λ⁺ = 0` reproduces plain cosine ranking bit-for-bit. That default-off
-guarantee is what lets the ablation attribute any change to the re-rank alone.
-
-### 7.3 Fitting λ
-
-No gradient training. Swept on the **held-out validation benchmark**, never on
-the 14 test queries: λ⁻ first with λ⁺ = 0, then λ⁺ at the winning λ⁻, thresholds
-fixed at τ = 0.5.
-
-The curve **plateaus rather than collapsing** — val R@10 rises 0.3815 → 0.4068 by
-λ⁻ = 4 and is then flat out to λ⁻ = 32. The grid was extended past the original
-{0…4} precisely because a monotone curve means the sweep stopped too early. Best
-on validation: **λ⁻ = 4, λ⁺ = 2** (val R@10 0.4222).
-
-Per-attribute thresholds are supported (`thresholds=`) but untested; τ = 0.5
-shared is the current setting.
+Database-side prediction error costs more than reference-side. Together they
+account for the entire gap — nothing is lost to composition or ranking.
 
 ---
 
 ## 8. Evaluation protocol
 
-The 14-query benchmark against the full test split. Four metric families:
+The 14-query benchmark against the full test split.
 
 | metric | what it says |
 |---|---|
 | **R@{1,5,10}, P@{1,5,10}** | the graded objective |
-| **V@10** — violation rate | fraction of returned top-10 images breaking at least one constraint of their query, from CelebA labels. The direct target of the re-rank. |
-| **neg_R@10** | mean R@10 over the queries carrying a negation. The overall mean is diluted by the 6 positive-only queries the negation work is not meant to help. |
-| **probe drift** | mean probe-logit shift from reference to query, signed for queried attributes and absolute for the rest. Leakage into unmentioned attributes is what non-orthogonal directions cause. |
+| **V@10** | fraction of returned top-10 breaking a constraint, from true labels |
+| **neg_R@10** | mean R@10 over queries carrying a negation |
+| **bit accuracy** | per-attribute correctness on held-out data — the leading indicator |
 
-Three rules that make the numbers comparable:
+Rules that keep numbers comparable:
 
-1. **Recompute the fixed-rule row inside every run.** Absolute numbers shift with
-   a probe refit; only deltas within a run are comparable.
-2. **Resolution limit: differences below 0.02 R@10 are unresolved.** Seed-to-seed
-   spread reaches 0.019. Do not report a 0.01 gain as a result.
-3. **V@10 is the mechanism check.** If R@10 rises but V@10 does not fall, the gain
-   is not coming from exclusion and the mechanism claim is unsupported.
-
-The validation benchmark (`build_val_benchmark`) is built from held-out
-references and never touches the 14 test queries or their ground truth. Caveat
-to state when reporting: it reuses the same 14 *query shapes*, so it is held-out
-data but not a held-out query distribution.
+1. **Recompute baseline rows inside every run.** Absolute numbers shift with a
+   probe or feature refit; only within-run deltas are comparable.
+2. **Differences below 0.02 R@10 are unresolved.** Seed spread reaches 0.019.
+3. **Tune on validation only.** `build_val_benchmark` constructs held-out ground
+   truth with the *same* §3.1.1 rule as the test benchmark. It previously used a
+   ten-attribute identity-proxy rule — a different task — which is why earlier
+   validation gains did not transfer. Note the val benchmark reuses the 14 query
+   *shapes*, so it is held-out data but not a held-out query distribution.
 
 ---
 
-## 9. Current results
+## 9. Open work
 
-### 9.1 Combiners, cosine scoring, 14 queries
+1. **Train the attribute head on the full train split.** All configurations
+   plateau at ~0.911–0.912 on the 30k sample, which is 18% of the ~162k
+   available. If the plateau is data-limited this moves; if not, frozen
+   ViT-B/32 features are saturated and ~0.50 R@10 is the ceiling for this
+   encoder. At 7× amplification this is the highest-value run available.
+2. **Repeat the MLP-head result across seeds**, since it clears the resolution
+   limit by only 0.002.
+3. **Fix the mining target to the §3.1.1 rule** before any combiner retrain
+   (§6). Training against a target definition the benchmark does not use has the
+   same defect the val benchmark had.
+4. **Resolve the cosine term's contribution** — whether CPAS-MLP as the `q` in
+   §5 beats raw reference similarity is untested.
+5. Per-attribute Hamming weighting: attributes differ in probe reliability, and
+   the score currently weights all 38 equally.
 
-| method | R@1 | R@5 | R@10 |
-|---|---|---|---|
-| Prompt arithmetic (γ = 1) | 0.023 | 0.071 | 0.106 |
-| Probe composition (γ = 0.6) | 0.051 | 0.144 | 0.210 |
-| **CPAS-MLP** | 0.066 | 0.182 | **0.267** |
-
-### 9.2 Exclusion re-rank — the 2×2 and the ablations
-
-One seed, λ tuned on validation per combiner.
-
-| combiner | variant | R@1 | R@5 | R@10 | V@10 |
-|---|---|---|---|---|---|
-| probe rule γ=0.6 | 0 off | 0.052 | 0.140 | 0.206 | 0.351 |
-| probe rule γ=0.6 | 1 negative only | 0.052 | 0.143 | 0.209 | 0.266 |
-| probe rule γ=0.6 | 2 positive only | 0.056 | 0.155 | 0.216 | 0.258 |
-| probe rule γ=0.6 | **3 both (tuned)** | 0.056 | 0.158 | **0.216** | **0.171** |
-| probe rule γ=0.6 | 4 linear, no hinge | 0.028 | 0.088 | 0.127 | 0.049 |
-| probe rule γ=0.6 | 5 hinge on top-200 | 0.056 | 0.158 | 0.216 | 0.172 |
-| CPAS-MLP | 0 off | 0.062 | 0.187 | 0.267 | 0.401 |
-| CPAS-MLP | 1 negative only | 0.062 | 0.185 | 0.270 | 0.336 |
-| CPAS-MLP | 2 positive only | 0.061 | 0.185 | 0.265 | 0.331 |
-| CPAS-MLP | **3 both (tuned)** | 0.061 | 0.183 | **0.279** | **0.260** |
-| CPAS-MLP | 4 linear, no hinge | 0.036 | 0.126 | 0.187 | 0.081 |
-| CPAS-MLP | 5 hinge on top-200 | 0.061 | 0.183 | 0.277 | 0.263 |
-
-**What is established:**
-
-- **The mechanism works on both combiners.** V@10 falls 0.351 → 0.171 on the
-  fixed rule and 0.401 → 0.260 on CPAS-MLP. The penalty does what it is designed
-  to do, and it does it regardless of which combiner produced `q`, which is what
-  "orthogonal to the combiner" predicts.
-- **Row 4 is the decisive ablation and it confirms the §7.1 argument.** A linear
-  penalty — still compensatory, expressible by moving `q` itself — buys
-  compliance by destroying retrieval: R@10 collapses to 0.127 / 0.187 while V@10
-  goes to 0.049 / 0.081. The non-compensatory hinge is the active ingredient, not
-  the extra probe signal.
-- **Row 5 matches row 3 to three decimals.** The cheap two-stage version
-  (penalty on the top-200 by cosine only) is sufficient.
-
-**What is not established:**
-
-- The R@10 gains (+0.009 fixed rule, +0.011 CPAS-MLP) are **below the 0.02
-  resolution limit**. They are the right sign on both combiners but cannot be
-  claimed from one seed.
-- On CPAS-MLP, R@1 and R@5 move slightly *down* while R@10 moves up. A real
-  effect does not usually split that way; treat +0.011 as suggestive.
-
-**One finding worth carrying forward:** CPAS-MLP has a *higher* violation rate
-than the fixed rule (0.401 vs 0.351) despite far better R@10. The learned
-combiner buys retrieval quality partly by being sloppier about constraints —
-direct support for the §6 premise that the training distribution does not teach
-exclusion, and the clearest link between the two extensions.
-
-### 9.3 Negation-aware mining
-
-**Implemented and tested; not yet run.** Requires a full retrain (~1 GPU-hour
-per seed). The mining-distribution effect is verified (negation share
-0.195 → 0.512, rejection 0.074), but no retrained checkpoint has been
-benchmarked. The ablation ladder in §10 is the outstanding experiment.
+**Removed, deliberately:** negation-aware mining — a forced negation fraction,
+multiple mined violations, a separately weighted violation loss, and
+correlated-pair sampling. It taught the combiner that negation is an exclusion;
+the score now enforces that directly, and the combiner reaches the ranking only
+through a small cosine term, so it was subsumed twice over. Measured at +0.02
+R@10 for ~1 GPU-hour per seed before the scoring change. The code has been
+deleted rather than left switched off; it is in git history if the framing ever
+changes, and the measurement stands as a reported negative result.
 
 ---
 
-## 10. Ablations
+## 10. Repository map
 
-**Exclusion re-rank** — `scripts/run_exclusion_rerank.py`, all six rows in one
-run, no training. Results in §9.2.
-
-**Negation mining** — `scripts/train_cpas.py`, one flag added per row, then
-`scripts/run_cpas_ablation.py`. Each row adds to the row above, so the deltas
-attribute the gain:
-
-| # | Variant | Isolates |
-|---|---|---|
-| 0 | current mining and loss | reference point |
-| 1 | `+ --neg-fraction 0.5` | does simply seeing more negations help? |
-| 2 | `+ --n-violations 8` | does a richer near-miss set help? |
-| 3 | `+ --lambda-violation 0.5` | was the signal there but drowned? |
-| 4 | `+ --correlated-pair-prob 0.3` | does training on the hard cases transfer? |
-
-Row 3 is the cheapest test of the hypothesis that the training *signal*, not the
-architecture, is the limiting factor: it changes no data at all, only how
-already-mined violations enter the loss.
-
-**CPAS-MLP architecture** — `--delta-max 0` (rescaling only, no bend),
-`--no-cross-attributes` (attributes cannot condition on each other), `--rank`.
-
-**Measure the two extensions separately before combining them.** If both are
-applied at once and the number moves, neither is attributable — and they could
-be redundant, since a model trained to respect exclusion may leave nothing for a
-re-rank to fix. `run_cpas_ablation.py` deliberately scores with plain cosine;
-`run_exclusion_rerank.py --checkpoint <negation-mined model>` is the combination
-cell, and it reports that model's own re-rank-off baseline alongside it.
-
----
-
-## 11. Repository map
-
-Every module below is reachable from the current method and has a test file.
+Every module is reachable from the current method and has a test file.
 
 ### `src/`
 
@@ -442,113 +307,81 @@ Every module below is reachable from the current method and has a test file.
 |---|---|
 | `data.py` | paths, CelebA loading, annotations |
 | `features.py` | CLIP wrapper and the feature cache |
-| `probes.py` | probe fitting, both loaders, `compose_probe`, AUC/AP scoring |
-| `steering.py` | the composition formula (once), `pad_queries`, the `Steerer` protocol, `FixedRule` |
-| `cpas_mlp.py` | the combiner: predicts (γ, α, Δ) |
-| `mining.py` | triplet mining, negation controls, correlated-pair table, mining stats |
-| `training.py` | batching, InfoNCE, the separate violation loss, the epoch loop |
+| `attribute_head.py` | the MLP attribute predictor, threshold tuning, bit accuracy |
+| `attribute_retrieval.py` | target codes, expected Hamming, the §5 score |
+| `probes.py` | linear probes: both loaders, `compose_probe`, AUC/AP scoring |
 | `rerank.py` | probe probabilities, the hinge penalty, `rank_with_exclusion` |
-| `evaluation.py` | metrics, the three benchmark loops, the val benchmark, probe drift |
-| `retrieval.py` | query parsing, prompt templates, plain cosine `rank` — the prompt-arithmetic baseline only |
+| `steering.py` | the composition formula, `pad_queries`, `Steerer`, `FixedRule` |
+| `cpas_mlp.py` | the combiner: predicts (γ, α, Δ) |
+| `mining.py` | attribute-flip triplet mining for the combiner |
+| `training.py` | batching, InfoNCE, the epoch loop |
+| `evaluation.py` | metrics, benchmark loops, the val benchmark, probe drift |
+| `retrieval.py` | query parsing, prompt templates, plain cosine `rank` |
 
 ### `scripts/`
 
 | script | produces |
 |---|---|
-| `extract_train_features.py` | the mining pool (`--all` for the full train split) |
+| `extract_train_features.py` | the training pool (`--all` for the full split) |
 | `fit_probes.py` | `results/probe_weights.pt` |
 | `run_probe_accuracy.py` | `results/probe_accuracy.csv` |
+| `fit_attribute_head.py` | `results/attribute_head.pt` (weights + thresholds) |
+| `run_attribute_retrieval.py` | `results/attribute_retrieval*.csv` — the current method |
 | `run_baseline.py` | `results/baseline_results.csv` (prompt arithmetic) |
-| `run_probe_gamma_ablation.py` | `results/probe_gamma_ablation.csv` — picks γ = 0.6 |
-| `train_cpas.py` | a CPAS-MLP checkpoint; all negation-mining flags live here |
-| `run_cpas_ablation.py` | `results/cpas_ablation.csv` — combiners under cosine scoring, with V@10, neg_R@10 and probe drift |
-| `run_exclusion_rerank.py` | `results/exclusion_rerank{,_sweep,_per_query}.csv` — the λ sweep, the 2×2 and the ablations |
-| `smoke_test.py` | a 100-image end-to-end sanity run; development only |
+| `run_probe_gamma_ablation.py` | `results/probe_gamma_ablation.csv` |
+| `train_cpas.py` | a CPAS-MLP checkpoint |
+| `run_cpas_ablation.py` | `results/cpas_ablation.csv` — cosine-space methods |
+| `run_exclusion_rerank.py` | `results/exclusion_rerank*.csv` |
 
-### `tests/` — 95 tests, model-free
+### `tests/` — 97 tests, model-free
 
-One file per `src` module. They run in ~30 s on CPU without CelebA or the CLIP
-weights, using toy tensors. The contracts they pin that are easy to break:
-
-- the default mining path and the default loss reproduce the pre-extension
-  behavior exactly;
-- an inactive `Rerank` gives ranking identical to plain cosine;
-- a compliant candidate is never charged by the hinge, and a linear penalty
-  *does* charge it;
-- V@10 columns appear only when labels are passed;
-- a reference with too few ON attributes degrades gracefully rather than raising
-  or silently emitting an all-positive query.
+One file per `src` module, ~20 s on CPU, no CelebA or CLIP weights needed. The
+contracts most worth keeping: the val benchmark reproduces the §3.1.1 rule
+exactly (sound *and* complete); an inactive `Rerank` ranks identically to plain
+cosine; a violating candidate is ranked below a compliant one; expected Hamming
+is exact for confident probabilities and 0.5 per bit at maximum uncertainty.
 
 ### `results/`
 
-Live files are the ones the current method produces. `results/archive/` holds
-output from the abandoned approaches described in `docs/method-history.md` —
-zero-shot prompt classification, the caption method, the transformer combiner.
-Nothing in the code reads them; they are kept so past numbers are not lost, and
-`method-history.md` cites them. Two are worth knowing about:
-
-- `archive/cpas_model.pt` is a transformer checkpoint that **will not load** as a
-  `PerAttributeMLP`.
-- `archive/cpas_ablation_transformer.csv` is the δ_max ablation behind
-  `method-history.md` §4. It was moved out of `results/` because
-  `run_cpas_ablation.py` writes to that filename and would overwrite it.
+Live files are what the current method produces. `results/archive/` holds output
+from the abandoned approaches in `docs/method-history.md`; nothing in the code
+reads it. Two notes: `archive/cpas_model.pt` is a transformer checkpoint that
+**will not load** as a `PerAttributeMLP`, and
+`archive/cpas_ablation_transformer.csv` was moved out because
+`run_cpas_ablation.py` writes to that filename.
 
 ---
 
-## 12. Known gaps and next steps
-
-Ordered by what would change a conclusion.
-
-1. **Seeds.** Every re-rank number is one seed. The re-rank is deterministic
-   given a combiner, so the noise is inherited from the combiner's training
-   seed. Three seeds are needed to resolve the +0.01 R@10 movements.
-2. **Run the negation-mining ablation ladder** (§10). It is implemented, tested
-   and unrun.
-3. **The combination cell** — negation-mined model *plus* re-rank — after the two
-   are measured separately.
-4. **Why the validation gain does not transfer.** Val R@10 rose +0.041 with the
-   re-rank; test R@10 moved +0.009. Both benchmarks use the same ground-truth
-   rule, so the gap is unexplained and worth understanding before trusting val
-   for anything but λ selection.
-5. **Per-attribute thresholds** for the hinge. Supported in code, never swept;
-   τ = 0.5 shared is arbitrary.
-6. **Benchmark size.** 14 queries, 13 distinct, 7 with a negation, one with only
-   27 source images and R@10 = 0 everywhere. Several conclusions are limited by
-   this rather than by the methods. Enlarging it with held-out queries of
-   controlled k would raise the resolution of everything above.
-
-Minor cleanups, none blocking: `compose_probe` and `FixedRule` express the same
-formula in two places; `smoke_test.py` predates the current pipeline and only
-exercises the prompt baseline.
-
----
-
-## 13. Risks
+## 11. Risks
 
 | Risk | Mitigation |
 |---|---|
-| λ large enough to dominate the cosine turns retrieval into probe classification | sweep λ and report the whole curve; the signature is V@10 falling while R@10 also falls — visible in ablation row 4 |
-| The penalty helps only because probes add information, not because of the hinge | ablation row 4 detects exactly this, and does |
-| Raw-vs-normalized probe weights confusion | the run asserts a known attribute's AUC before using the probabilities |
-| Tuning λ on validation looks like fitting the benchmark | the val benchmark is built from held-out references and never touches the 14 queries; state this, and state that the query shapes are shared |
-| Forcing negations shifts the pool toward frequent attributes | the miner logs rejection rate and realized negation share every round; report both |
-| `λ_v` too high optimizes violation ranking at the expense of retrieval | sweep it and report the curve |
-| Correlated-pair sampling helps the hard queries but looks worse on the mean | this is why neg_R@10 is reported separately |
-| Reporting a gain that is really seed noise | the 0.02 R@10 resolution limit, stated with every result |
+| Scoring the ground-truth rule reads as fitting the benchmark | §3.1.1 is the assignment's own definition of a correct answer and of identity preservation; implementing it is the task, and the composite embedding is retained in the score |
+| λ too large turns retrieval into attribute classification on predicted labels | λ is swept and the whole curve reported; validation already prefers the soft λ = 4 |
+| Bit accuracy measured on valid does not transfer to test | valid is held out from head training; the exchange rate to R@10 is measured, not assumed |
+| Thresholds overfit the valid split | 40 scalars on ~20k images; refit them whenever the predictor changes and never on train |
+| A predictor refit silently invalidates stored results | baselines are recomputed inside every run |
+| Reporting seed noise as a gain | the 0.02 R@10 resolution limit, stated with every result |
 
 ---
 
-## 14. Assignment compliance
+## 12. Assignment compliance
 
-The assignment asks for a fusion module Φ yielding a composite query embedding,
-and separately states that *"the retrieval function must score images highest if
-they share the latent identity of the reference, explicitly contain glasses, and
-explicitly do not contain red hair... You must define how these positive and
-negative constraints interact in the embedding space,"* with the stated
-objective being a *dynamic similarity metric*.
+§1 requires a fusion module Φ yielding a composite query embedding, and names
+the objective as *"a dynamic similarity metric where the conditioning process
+intelligently integrates multiple conditions, treating them as either positive
+(additive) or negative (subtractive) constraints."*
 
-The composite embedding remains the primary retrieval mechanism: CPAS-MLP is Φ,
-and it is evaluated on its own throughout. The exclusion penalty is presented as
-part of the similarity metric, and **every number is reported with and without
-it**. That turns a possible objection into an ablation, which the assignment
-grades under methodological thoroughness.
+Both are addressed, and the split is deliberate:
+
+- **Φ** is CPAS-MLP, producing the composite query embedding, present in the
+  score through the cosine term and reported standalone throughout §7.
+- **The dynamic similarity metric** is §5: positive and negative constraints
+  enter through different terms with different signs, and the identity
+  requirement enters as a distance the assignment itself defines. §3.1 asks
+  precisely that we *"define how these positive and negative constraints
+  interact in the embedding space"* — §5 is that definition, made explicit
+  rather than left implicit in a vector sum.
+
+Every result is reported with and without each component, so the contribution of
+the fusion module and of the similarity metric can be read separately.

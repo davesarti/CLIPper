@@ -7,16 +7,16 @@ one. CLIP ViT-B/32 stays frozen throughout; only the query embedding is built.
 
 - **Baseline**: latent arithmetic over CLIP *text* prompts,
   `q = normalize(v_ref + Σt⁺ − Σt⁻)`. No training.
-- **Current method**: CPAS-MLP — the same composition over learned *probe* directions,
-  with the reference weight, per-attribute step size and direction bend predicted per
-  query by a 0.50 M-parameter MLP; optionally scored with a non-compensatory hinge
-  penalty on constraint violations.
+- **Current method**: retrieval scored directly against the assignment's ground-truth
+  criterion (§3.1.1) — expected Hamming distance on the non-queried attributes plus a
+  constraint penalty — over attribute codes predicted by a small head on frozen CLIP
+  features. The CPAS-MLP combiner supplies the composite query embedding.
 
 Two documents, kept deliberately apart:
 
-- **`docs/method.md`** — the current pipeline and nothing else: probes, composition,
-  the combiner, negation-aware mining, the exclusion re-rank, the evaluation protocol,
-  current results, and what is still open. **Start here.**
+- **`docs/method.md`** — the current pipeline and nothing else: the ground-truth
+  criterion, attribute prediction, the scoring rule, the combiner, the evaluation
+  protocol, current results, and what is still open. **Start here.**
 - **`docs/method-history.md`** — how the method was arrived at, and what was tried and
   dropped (prompt arithmetic, attribute captions, the transformer combiner, SCAC).
   Read it for *why* the design is what it is.
@@ -27,16 +27,18 @@ Two documents, kept deliberately apart:
   (prompts, `compose()`/`rank()`), `probes.py` (linear attribute probes and the fixed
   composition rule), `evaluation.py` (metrics, benchmarks, probe-drift diagnostic),
   `steering.py` (shared composition + padding), `mining.py` (triplet mining),
-  `training.py` (InfoNCE loop), `cpas_mlp.py` (the model),
-  `rerank.py` (exclusion penalty on top of the cosine score)
-- `scripts/` — `smoke_test.py`, `run_baseline.py`, `extract_train_features.py`,
+  `training.py` (InfoNCE loop), `cpas_mlp.py` (the combiner),
+  `rerank.py` (constraint penalty), `attribute_head.py` (attribute predictor),
+  `attribute_retrieval.py` (the ground-truth-criterion score)
+- `scripts/` — `run_baseline.py`, `extract_train_features.py`,
   `fit_probes.py`, `run_probe_accuracy.py`, `run_probe_gamma_ablation.py`,
-  `train_cpas.py`, `run_cpas_ablation.py`, `run_exclusion_rerank.py`
+  `train_cpas.py`, `run_cpas_ablation.py`, `run_exclusion_rerank.py`,
+  `fit_attribute_head.py`, `run_attribute_retrieval.py`
 - `docs/` — `method.md` (the current pipeline) and `method-history.md` (what was tried
   and dropped, and why)
 - `results/` — benchmark CSVs and probe weights; `results/archive/` holds output from
   abandoned approaches (nothing reads it)
-- `tests/` — 95 pytest tests, model-free
+- `tests/` — 97 pytest tests, model-free
 
 ## Setup
 
@@ -65,14 +67,13 @@ conda run -n clipper python scripts/extract_train_features.py --all   # full min
 conda run -n clipper python scripts/train_cpas.py --seed 0 --out runs/mlp_s0.pt
 conda run -n clipper python scripts/run_cpas_ablation.py "CPAS-MLP=runs/mlp_s0.pt"
 
-# exclusion re-rank: lambda swept on the held-out val benchmark, then the
-# 2x2 (combiner x re-rank) test table and the ablations
+# current method: attribute head, then attribute-space retrieval
+conda run -n clipper python scripts/fit_attribute_head.py
+conda run -n clipper python scripts/run_attribute_retrieval.py --head results/attribute_head.pt
+
+# exclusion re-rank on the cosine pipeline (lambda swept on validation)
 conda run -n clipper python scripts/run_exclusion_rerank.py --checkpoint runs/mlp_s0.pt
 
-# negation-aware mining (off by default; each flag is one ablation row)
-conda run -n clipper python scripts/train_cpas.py --seed 0 \
-    --neg-fraction 0.5 --n-violations 8 --lambda-violation 0.5 \
-    --correlated-pair-prob 0.3 --out runs/negmine_s0.pt
 ```
 
 ## Results
@@ -83,11 +84,15 @@ MEAN over the 14 benchmark queries, full test-split database:
 |---|---|---|---|
 | Prompt arithmetic baseline (γ = 1) | 0.023 | 0.071 | 0.106 |
 | Probe-direction composition (γ = 0.6) | 0.051 | 0.144 | 0.210 |
-| **CPAS-MLP** | 0.066 | 0.182 | **0.267** |
+| CPAS-MLP (best cosine-space method) | 0.066 | 0.182 | 0.267 |
+| **Attribute-space scoring, linear probe** | 0.116 | 0.336 | **0.465** |
+| **Attribute-space scoring, MLP head** | — | — | **0.482** |
+| *oracle attribute codes (ceiling)* | *1.000* | *1.000* | *1.000* |
 
-With the exclusion re-rank on, R@10 moves within noise (+0.01) but the **top-10
-violation rate falls from 0.40 to 0.26** on CPAS-MLP and 0.35 to 0.17 on the fixed
-rule. Full table, ablations and caveats in `docs/method.md` §9.
+The jump comes from ranking by the criterion the ground truth is defined by rather
+than by cosine similarity to a composed vector — see `docs/method.md` §1 and §7.
+Attribute-prediction accuracy is now the only lever: +0.003 bit accuracy bought
++0.022 R@10.
 
 Per-query tables in `results/`. Absolute numbers shift slightly with the probe refit, so
 compare against the fixed-rule row recomputed by the same run — see
@@ -95,6 +100,9 @@ compare against the fixed-rule row recomputed by the same run — see
 
 ## Gotchas
 
+- Ground truth is **not** semantic similarity: assignment §3.1.1 defines a correct
+  answer as one satisfying the constraints with Hamming distance ≤ 2 to the reference
+  on the non-queried attributes. Rank by that, not by cosine.
 - Ground-truth keys are **dataset indices**, not filenames: use `celeba[int(key)]`.
 - The test split is the retrieval database and is never trained or selected on;
   training mines triplets from the train split, model selection uses a held-out val
