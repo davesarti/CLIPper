@@ -87,9 +87,12 @@ def fit_linear_probes(
     """
     n, d = features.shape
     a = labels.shape[1]
-    w = torch.zeros(a, d, requires_grad=True)
-    b = torch.zeros(a, requires_grad=True)
-    y = labels.float()
+    # Follow the features: on the full train split this is a GPU tensor, and
+    # zero-init on CPU would fail in the first matmul.
+    device = features.device
+    w = torch.zeros(a, d, device=device, requires_grad=True)
+    b = torch.zeros(a, device=device, requires_grad=True)
+    y = labels.float().to(device)
 
     pos_weight = None
     if class_balanced:

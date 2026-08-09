@@ -57,9 +57,12 @@ assert train_features.shape[0] == train_labels.shape[0], "train size mismatch"
 assert valid_features.shape[0] == valid_labels.shape[0], "valid size mismatch"
 assert len(attribute_names) == train_labels.shape[1], "attribute count mismatch"
 
-print(f"fitting on {tuple(train_features.shape)} from {train_cache.name}, "
-      f"scoring {tuple(valid_features.shape)}")
-w, b = fit_linear_probes(train_features, train_labels)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"fitting on {tuple(train_features.shape)} from {train_cache.name} "
+      f"({device}), scoring {tuple(valid_features.shape)}")
+w, b = fit_linear_probes(train_features.to(device), train_labels.to(device))
+# Scoring is a per-attribute Python loop, so bring the probes back to CPU.
+w, b = w.cpu(), b.cpu()
 aucs, aps = score_attributes(valid_features @ w.T + b, valid_labels)
 
 rows = [
