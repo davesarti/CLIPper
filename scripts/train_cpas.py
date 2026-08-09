@@ -83,7 +83,8 @@ slug = ClipEncoder.MODEL_NAME.split("/")[-1]
 
 pool_path = resolve_pool(paths.features_dir, args.pool_features)
 if not pool_path.is_file():
-    sys.exit(f"Missing {pool_path}: extract the train-split features first.")
+    sys.exit(f"Missing {pool_path}:\n"
+             f"  uv run scripts/extract_train_features.py --all")
 features, indices = load_pool(pool_path)
 print(f"Mining pool: {pool_path.name} ({features.shape[0]} images) on {device}")
 

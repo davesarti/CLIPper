@@ -52,13 +52,16 @@ slug = ClipEncoder.MODEL_NAME.split("/")[-1]
 
 pool_path = resolve_pool(paths.features_dir, args.pool_features)
 if not pool_path.is_file():
-    sys.exit(f"Missing {pool_path}: run scripts/extract_train_features.py --all")
+    sys.exit(f"Missing {pool_path}:\n"
+             f"  uv run scripts/extract_train_features.py --all")
 features, indices = load_pool(pool_path)
 labels = load_dataset(paths, split="train").attr[indices].bool()
 
 valid_path = paths.features_dir / f"{slug}_valid.pt"
 if not valid_path.is_file():
-    sys.exit(f"Missing {valid_path}: the valid split is the selection surface.")
+    sys.exit(f"Missing {valid_path}: the valid split is the selection surface "
+             f"for the epoch and the thresholds.\n"
+             f"  uv run scripts/extract_train_features.py --split valid --all")
 v_saved = torch.load(valid_path, weights_only=True)
 if isinstance(v_saved, dict):
     val_features = v_saved["features"]

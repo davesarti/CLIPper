@@ -37,15 +37,16 @@ slug = ClipEncoder.MODEL_NAME.split("/")[-1]
 train = load_dataset(paths, split="train")
 train_cache = resolve_pool(paths.features_dir)
 if not train_cache.is_file():
-    sys.exit(f"Missing {train_cache}: run scripts/extract_train_features.py first.")
+    sys.exit(f"Missing {train_cache}:\n"
+             f"  uv run scripts/extract_train_features.py --all")
 train_features, indices = load_pool(train_cache)
 train_labels = train.attr[indices]
 
 valid = load_dataset(paths, split="valid")
 valid_cache = paths.features_dir / f"{slug}_valid.pt"
 if not valid_cache.is_file():
-    sys.exit(f"Missing {valid_cache}: run scripts/extract_train_features.py "
-             "--split valid --all first.")
+    sys.exit(f"Missing {valid_cache}:\n"
+             f"  uv run scripts/extract_train_features.py --split valid --all")
 valid_features = torch.load(valid_cache, weights_only=True)
 if isinstance(valid_features, dict):
     valid_features = valid_features["features"]

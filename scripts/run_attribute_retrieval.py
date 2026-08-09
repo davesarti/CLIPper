@@ -45,9 +45,19 @@ parser.add_argument("--head", type=Path,
 parser.add_argument("--val-refs", type=int, default=200,
                     help="held-out references per query for the sweep")
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--out", type=Path,
-                    default=REPO_ROOT / "results" / "attribute_retrieval.csv")
+parser.add_argument("--out", type=Path, default=None,
+                    help="default: results/attribute_retrieval.csv, or "
+                         "..._no_cosine.csv under --no-cosine")
+parser.add_argument("--no-cosine", action="store_true",
+                    help="score by attributes alone: pin w_cos = 0 instead of "
+                         "sweeping it, dropping every embedding term from the "
+                         "ranking (docs/method.md S5, third term)")
 args = parser.parse_args()
+cos_grid = (0.0,) if args.no_cosine else COS_GRID
+if args.out is None:
+    stem = "attribute_retrieval_no_cosine" if args.no_cosine \
+        else "attribute_retrieval"
+    args.out = REPO_ROOT / "results" / f"{stem}.csv"
 
 paths = get_paths()
 celeba = load_dataset(paths)
@@ -124,7 +134,7 @@ for name, (probs, code) in predictors.items():
     val_code = val_probs > 0.5
     scores = {}
     for lam in LAM_GRID:
-        for w in COS_GRID:
+        for w in cos_grid:
             r10 = val_recall(val_probs, val_code, lam, w)
             scores[(lam, w)] = r10
             sweep.append({"predictor": name, "lam_constraint": lam,

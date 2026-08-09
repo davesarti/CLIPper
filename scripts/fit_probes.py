@@ -48,8 +48,8 @@ paths = get_paths()
 device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 cache = resolve_pool(paths.features_dir, args.pool_features)
 if not cache.is_file():
-    sys.exit(f"Missing {cache}: run scripts/extract_train_features.py "
-             f"(add --all for the full split).")
+    sys.exit(f"Missing {cache}:\n"
+             f"  uv run scripts/extract_train_features.py --all")
 
 features, indices = load_pool(cache)
 train = load_dataset(paths, split="train")
