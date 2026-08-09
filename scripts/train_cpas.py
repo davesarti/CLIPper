@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.cpas_mlp import PerAttributeMLP
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import build_val_benchmark, score_val_benchmark
-from src.features import ClipEncoder
+from src.features import ClipEncoder, load_pool, resolve_pool
 from src.mining import TripletMiner, proxy_rows
 from src.probes import load_probes
 from src.retrieval import parse_query
@@ -81,21 +81,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 slug = ClipEncoder.MODEL_NAME.split("/")[-1]
 
 
-def resolve_pool() -> Path:
-    if args.pool_features:
-        return args.pool_features
-    full = paths.features_dir / f"{slug}_train.pt"
-    return full if full.is_file() else paths.features_dir / f"{slug}_train30k.pt"
-
-
-pool_path = resolve_pool()
+pool_path = resolve_pool(paths.features_dir, args.pool_features)
 if not pool_path.is_file():
     sys.exit(f"Missing {pool_path}: extract the train-split features first.")
-saved = torch.load(pool_path, weights_only=True)
-if isinstance(saved, dict):  # {"features","indices"} sample
-    features, indices = saved["features"], saved["indices"]
-else:  # plain tensor = the whole train split in order
-    features, indices = saved, torch.arange(saved.shape[0])
+features, indices = load_pool(pool_path)
 print(f"Mining pool: {pool_path.name} ({features.shape[0]} images) on {device}")
 
 train_split = load_dataset(paths, split="train")

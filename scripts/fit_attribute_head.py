@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.attribute_head import bit_accuracy, fit_attribute_head, tune_thresholds
 from src.data import get_paths, load_dataset
-from src.features import ClipEncoder
+from src.features import ClipEncoder, load_pool, resolve_pool
 from src.probes import load_raw_probes
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -50,18 +50,10 @@ paths = get_paths()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 slug = ClipEncoder.MODEL_NAME.split("/")[-1]
 
-pool_path = args.pool_features
-if pool_path is None:
-    full = paths.features_dir / f"{slug}_train.pt"
-    pool_path = full if full.is_file() else paths.features_dir / f"{slug}_train30k.pt"
+pool_path = resolve_pool(paths.features_dir, args.pool_features)
 if not pool_path.is_file():
     sys.exit(f"Missing {pool_path}: run scripts/extract_train_features.py --all")
-
-saved = torch.load(pool_path, weights_only=True)
-if isinstance(saved, dict):
-    features, indices = saved["features"], saved["indices"]
-else:
-    features, indices = saved, torch.arange(saved.shape[0])
+features, indices = load_pool(pool_path)
 labels = load_dataset(paths, split="train").attr[indices].bool()
 
 valid_path = paths.features_dir / f"{slug}_valid.pt"

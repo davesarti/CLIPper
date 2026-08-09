@@ -28,18 +28,17 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data import get_paths, load_dataset
-from src.features import ClipEncoder
+from src.features import ClipEncoder, load_pool, resolve_pool
 from src.probes import fit_linear_probes, score_attributes
 
 paths = get_paths()
 slug = ClipEncoder.MODEL_NAME.split("/")[-1]
 
 train = load_dataset(paths, split="train")
-train_cache = paths.features_dir / f"{slug}_train30k.pt"
+train_cache = resolve_pool(paths.features_dir)
 if not train_cache.is_file():
     sys.exit(f"Missing {train_cache}: run scripts/extract_train_features.py first.")
-saved = torch.load(train_cache, weights_only=True)
-train_features, indices = saved["features"], saved["indices"]
+train_features, indices = load_pool(train_cache)
 train_labels = train.attr[indices]
 
 valid = load_dataset(paths, split="valid")
@@ -58,7 +57,8 @@ assert train_features.shape[0] == train_labels.shape[0], "train size mismatch"
 assert valid_features.shape[0] == valid_labels.shape[0], "valid size mismatch"
 assert len(attribute_names) == train_labels.shape[1], "attribute count mismatch"
 
-print(f"fitting on {tuple(train_features.shape)}, scoring {tuple(valid_features.shape)}")
+print(f"fitting on {tuple(train_features.shape)} from {train_cache.name}, "
+      f"scoring {tuple(valid_features.shape)}")
 w, b = fit_linear_probes(train_features, train_labels)
 aucs, aps = score_attributes(valid_features @ w.T + b, valid_labels)
 

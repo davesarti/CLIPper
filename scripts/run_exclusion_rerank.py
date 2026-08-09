@@ -37,7 +37,7 @@ from src.evaluation import (
     run_probe_benchmark,
     score_val_benchmark,
 )
-from src.features import ClipEncoder, load_or_extract
+from src.features import ClipEncoder, load_or_extract, load_pool, resolve_pool
 from src.probes import load_probes, load_raw_probes, roc_auc
 from src.rerank import Rerank, database_probe_probs
 from src.retrieval import parse_query
@@ -130,15 +130,8 @@ if "CPAS-MLP" not in combiners:
 # The val pool is the held-out slice of the train split used during training,
 # rebuilt with the same seed and fraction so a validation reference is never a
 # training candidate (mirrors scripts/train_cpas.py).
-slug = ClipEncoder.MODEL_NAME.split("/")[-1]
-pool_path = paths.features_dir / f"{slug}_train.pt"
-if not pool_path.is_file():
-    pool_path = paths.features_dir / f"{slug}_train30k.pt"
-saved = torch.load(pool_path, weights_only=True)
-if isinstance(saved, dict):
-    pool_features, pool_indices = saved["features"], saved["indices"]
-else:
-    pool_features, pool_indices = saved, torch.arange(saved.shape[0])
+pool_path = resolve_pool(paths.features_dir)
+pool_features, pool_indices = load_pool(pool_path)
 pool_labels = load_dataset(paths, split="train").attr[pool_indices].bool()
 
 perm = torch.randperm(pool_features.shape[0],

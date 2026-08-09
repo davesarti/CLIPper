@@ -46,6 +46,33 @@ class ClipEncoder:
         return feats / feats.norm(dim=-1, keepdim=True)
 
 
+def resolve_pool(features_dir, override=None) -> Path:
+    """Path to the train-split feature pool: the full split if it exists.
+
+    Every script that trains on train-split features resolves it the same way,
+    so extracting the full split with `extract_train_features.py --all` upgrades
+    all of them at once instead of only the ones that happened to look for it.
+    """
+    if override is not None:
+        return Path(override)
+    slug = ClipEncoder.MODEL_NAME.split("/")[-1]
+    full = Path(features_dir) / f"{slug}_train.pt"
+    return full if full.is_file() else Path(features_dir) / f"{slug}_train30k.pt"
+
+
+def load_pool(path) -> tuple[torch.Tensor, torch.Tensor]:
+    """(features, train-split indices) from either cache layout.
+
+    The sampled pool stores {"features", "indices"}; the full split is a plain
+    tensor in dataset order, so its indices are simply 0..N-1. Callers need the
+    indices to align train-split labels with the rows.
+    """
+    saved = torch.load(path, weights_only=True)
+    if isinstance(saved, dict):
+        return saved["features"], saved["indices"]
+    return saved, torch.arange(saved.shape[0])
+
+
 def cache_path(features_dir: Path, split: str) -> Path:
     model_slug = ClipEncoder.MODEL_NAME.split("/")[-1]
     return features_dir / f"{model_slug}_{split}.pt"

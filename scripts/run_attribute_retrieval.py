@@ -26,7 +26,7 @@ from src.attribute_head import load_attribute_head
 from src.attribute_retrieval import rank_by_attributes, target_code
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import MAX_HAMMING, _query_row, _with_mean_row, negation_subset
-from src.features import ClipEncoder, load_or_extract
+from src.features import ClipEncoder, load_or_extract, load_pool, resolve_pool
 from src.probes import load_probes, load_raw_probes
 from src.retrieval import parse_query
 
@@ -79,15 +79,8 @@ else:
 # ------------------------------------------------ sweep on held-out val data
 # The val pool is a held-out slice of the train split; its ground truth uses the
 # same S3.1.1 rule as the test benchmark, so a gain here is meaningful.
-slug = ClipEncoder.MODEL_NAME.split("/")[-1]
-pool_path = paths.features_dir / f"{slug}_train.pt"
-if not pool_path.is_file():
-    pool_path = paths.features_dir / f"{slug}_train30k.pt"
-saved_pool = torch.load(pool_path, weights_only=True)
-if isinstance(saved_pool, dict):
-    pool_features, pool_indices = saved_pool["features"], saved_pool["indices"]
-else:
-    pool_features, pool_indices = saved_pool, torch.arange(saved_pool.shape[0])
+pool_path = resolve_pool(paths.features_dir)
+pool_features, pool_indices = load_pool(pool_path)
 pool_labels = load_dataset(paths, split="train").attr[pool_indices].bool()
 perm = torch.randperm(pool_features.shape[0],
                       generator=torch.Generator().manual_seed(0))
