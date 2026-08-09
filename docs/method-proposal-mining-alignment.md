@@ -375,10 +375,18 @@ graded attributes is tempting and probably productive, and it is deliberately
 
 Two knobs, two experiments. Restore neutrality first; tilt afterwards, if at all.
 
-**Implementation.** `measure_mining_rule.py` already produces the retention
-column; save it as a table, load it at miner init, and replace
-`torch.randperm(A)[:k]` with `torch.multinomial(weights, k, replacement=False)`.
-Default stays uniform so the ablation is possible.
+**Implementation.** `scripts/measure_mining_rule.py` writes the retention column
+to `results/mining_retention.pt`; `Miner(weights=...)` draws flips with
+`torch.multinomial` instead of `torch.randperm`, and
+`train_cpas.py --sampling-weights results/mining_retention.pt` wires the two
+together. `mining.retention_weights` does the inversion, with a floor so an
+attribute that never survived the measurement cannot divide by zero and swallow
+the whole sampling budget. **Default is uniform**, so the weighted run is an
+ablation against the unweighted one rather than a silent change.
+
+The table is tied to the pool it was measured on. Refit on a different pool and
+it corrects for a filter that is no longer the one running — the saved file
+records `pool`, `images` and `samples` so this is checkable.
 
 ---
 
@@ -407,14 +415,20 @@ New and updated contracts, all model-free like the existing 97:
 
 | # | step | status | effort |
 |---|---|---|---|
-| 0 | Feasibility measurement (§7) | ✅ **done** — `scripts/measure_mining_rule.py` | — |
-| 1 | `src/criterion.py` + tests; refactor `build_val_benchmark` onto it | todo | short |
-| 2 | Rewrite `sample()` and `MinedQuery` + tests | todo | medium |
-| 3 | Negatives tensor, padding mask, false-negative mask + tests | todo | medium |
-| 4 | Attribute sampling weights (§7.1), default off | todo | short |
-| 5 | Renames across call sites | todo | short |
-| 6 | Retrain CPAS-MLP, 3 seeds | todo | ~2h15/seed on the full pool |
-| 7 | Evaluate: `run_cpas_ablation.py`, then `run_exclusion_rerank.py` | todo | minutes |
+| 0 | Feasibility measurement (§7) | ✅ done — `scripts/measure_mining_rule.py` | — |
+| 1 | `src/criterion.py` + tests; refactor `build_val_benchmark` onto it | ✅ done | — |
+| 2 | Rewrite `sample()` and `MinedQuery` + tests | ✅ done | — |
+| 3 | Negatives tensor, padding mask, false-negative mask + tests | ✅ done | — |
+| 4 | Attribute sampling weights (§7.1), default off | ✅ done | — |
+| 5 | Renames across call sites | ✅ done | — |
+| 6 | Retrain CPAS-MLP, 3 seeds | **todo** | ~2h15/seed on the full pool |
+| 7 | Evaluate: `run_cpas_ablation.py`, then `run_exclusion_rerank.py` | **todo** | minutes |
+
+Steps 1–5 land as one change: they are a single rewrite of what counts as a
+correct answer, and splitting them would leave the repo in states where the
+miner and the val benchmark disagree — the exact condition this fixes. Tests:
+**113 passing**, plus 4 pre-existing failures that need CelebA on disk and are
+unrelated to this change (verified by re-running them on a clean tree).
 
 Step 6 is what the retrain is *for*, and it is worth being explicit: it will not
 make cosine-space composition competitive with the attribute-space score. The

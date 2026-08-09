@@ -36,7 +36,7 @@ from src.cpas_mlp import PerAttributeMLP
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import build_val_benchmark, score_val_benchmark
 from src.features import ClipEncoder, load_pool, resolve_pool
-from src.mining import TripletMiner, proxy_rows
+from src.mining import Miner, retention_weights
 from src.probes import load_probes
 from src.retrieval import parse_query
 from src.training import run_epoch
@@ -64,6 +64,14 @@ parser.add_argument("--no-cross-attributes", dest="no_cross_attributes",
                     action="store_true",
                     help="ablation: attributes cannot condition on each other "
                          "(zeroes the pooled context)")
+parser.add_argument("--n-negatives", type=int, default=8,
+                    help="mined negatives per family (violators, drifters); the "
+                         "reference always occupies one further slot")
+parser.add_argument("--sampling-weights", type=Path, default=None,
+                    help="per-attribute retention table from "
+                         "scripts/measure_mining_rule.py; flips are then drawn "
+                         "at 1/retention so the rejection step stops choosing "
+                         "the training distribution. Default: uniform")
 parser.add_argument("--patience", type=int, default=15,
                     help="stop after this many main-phase epochs without a val "
                          "R@10 improvement; 0 disables early stopping")
@@ -99,10 +107,23 @@ attr_index = {name: i for i, name in enumerate(attributes)}
 perm = torch.randperm(features.shape[0], generator=torch.Generator().manual_seed(0))
 split = int(features.shape[0] * (1 - VAL_FRACTION))
 pools = {"train": perm[:split], "val": perm[split:]}
-rows = proxy_rows(attributes)
 train_pool = features[pools["train"]].to(device)
 val_pool = features[pools["val"]].to(device)
-train_miner = TripletMiner(labels[pools["train"]], train_pool, rows, seed=args.seed)
+train_labels = labels[pools["train"]]
+
+# Rejection under the S3.1.1 rule is attribute-dependent, so uniform flip
+# sampling lets the filter pick the training distribution for us. Weights of
+# 1/retention undo that; without the table, sampling stays uniform and the run
+# reproduces the unweighted behaviour exactly.
+weights = None
+if args.sampling_weights:
+    saved = torch.load(args.sampling_weights, weights_only=True)
+    retention = saved["retention"] if isinstance(saved, dict) else saved
+    weights = retention_weights(retention)
+    print(f"Sampling weights from {args.sampling_weights.name}: "
+          f"{float(weights.min()):.2f}-{float(weights.max()):.2f}")
+train_miner = Miner(train_labels, n_negatives=args.n_negatives,
+                    weights=weights, seed=args.seed)
 
 # Held-out val benchmark, built once (ground truth does not depend on the model).
 annotations = load_annotations(paths)
@@ -156,7 +177,7 @@ try:
             triplets = train_miner.sample_batch(args.triplets, ks=ks)
 
         loss, proxy_r1 = run_epoch(
-            model, triplets, train_pool, directions,
+            model, triplets, train_pool, directions, train_labels,
             optimizer=optimizer, batch_size=args.batch_size, device=device,
         )
         val_r10 = score_val_benchmark(model, val_pool, val_tasks, k=10)

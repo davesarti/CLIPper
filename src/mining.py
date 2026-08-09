@@ -1,177 +1,205 @@
-"""Attribute-flip triplet mining for CPAS training.
+"""Attribute-flip query mining, aimed at the criterion the task is graded by.
 
-Training examples are synthesized from CelebA train-split labels, never from
-retrieval annotations: sample a reference, flip k of its attributes (0->1 gives
-T+, 1->0 gives T-), then look up a real image that satisfies the flipped
-constraints and still looks like the same kind of person.
+There are no retrieval annotations for the train split, so training examples are
+synthesised from CelebA labels: sample a reference, flip k of its attributes
+(0->1 gives T+, 1->0 gives T-), then look up real images that are correct
+answers to the query that produces.
 
-Each example also carries the three hard negatives of the proposal
-(docs/method.md S5.1), each aimed at one shortcut:
+"Correct answer" is the assignment's own rule (src/criterion.py): constraints
+satisfied, and Hamming distance <= 2 from the reference over the non-queried
+attributes. An earlier version elected a single target by agreement on ten
+hand-picked identity-proxy attributes with a CLIP-similarity tiebreak - a
+different rule, which taught the model to change roughly ten things while the
+benchmark tolerates two (docs/method-proposal-mining-alignment.md).
 
-    violation  - satisfies T+ but breaks a T- (or misses a T+ when the query
-                 has no negatives): negation is a constraint, not a direction
-    distractor - satisfies the constraints but is a different kind of person:
-                 do not ignore the reference
-    lazy       - the reference itself: do not return it unchanged
+Two consequences of using the real rule are worth knowing:
+
+* Every member of the valid set is *equally* correct - S3.1.1 defines no
+  ordering inside it - so the target is **drawn uniformly**, not elected by an
+  argmax. Taking an argmax would teach a preference the criterion does not have.
+* The two conditions partition the wrong answers into exactly two families, and
+  the informative member of each sits at the boundary, not at the extreme:
+
+      violators - Hamming <= 2 but a constraint is broken. The reference itself
+                  is the h = 0 member; it keeps a dedicated slot in the batch
+                  (src/training.py) rather than being drawn.
+      drifters  - constraints satisfied but Hamming > 2, drawn from the
+                  innermost non-empty shell. The old distractor picked the
+                  *least* similar candidate, i.e. the easiest negative of its
+                  family; one that misses the ball by a single attribute is the
+                  one that teaches the decision boundary.
+
+Nothing here touches image features: the rule is pure label logic, which makes
+mining ~10x cheaper than the CLIP-similarity version and lets the tests run on
+label fixtures alone.
 """
 
 from dataclasses import dataclass
 
 import torch
 
-# Attributes used as an identity stand-in: CelebA has identity labels, but the
-# flipped-attribute target is a different person by construction, so "same
-# person" is approximated by agreement on stable, non-editable traits.
-IDENTITY_PROXY = (
-    "Male",
-    "Young",
-    "Chubby",
-    "Double_Chin",
-    "Oval_Face",
-    "Narrow_Eyes",
-    "Big_Nose",
-    "Big_Lips",
-    "Pointy_Nose",
-    "High_Cheekbones",
-)
+from src.criterion import MAX_HAMMING, MIN_TARGETS, hamming_to, satisfies
+
+N_NEGATIVES = 8   # per family; measured to be always available (S7 of the proposal)
 
 
 @dataclass(frozen=True)
-class Triplet:
-    """One mined training example; all fields index the mining pool."""
+class MinedQuery:
+    """One mined training example; all fields index the mining pool.
+
+    Every field is required and positional on purpose: this replaced a
+    three-field `Triplet`, and a missed call site should fail loudly rather than
+    default to something plausible.
+    """
 
     ref: int
-    positives: list[int]  # attribute rows to add
-    negatives: list[int]  # attribute rows to remove
-    target: int
-    violation: int  # a near miss that breaks a constraint
-    distractor: int
+    add: list[int]         # attribute rows to add    -> T+
+    remove: list[int]      # attribute rows to remove -> T-
+    target: int            # one valid answer, drawn uniformly
+    violators: list[int]   # inside the ball, break a constraint
+    drifters: list[int]    # satisfy the constraints, outside the ball
 
 
-class TripletMiner:
-    """Samples attribute-flip triplets from a labelled feature pool.
+class Miner:
+    """Samples attribute-flip queries from a labelled pool.
 
-    labels: (N, A) bool attribute matrix; features: (N, D) L2-normalized CLIP
-    features aligned with it; proxy_rows: attribute rows forming the identity
-    proxy; min_candidates: reject a sampled flip set that fewer than this many
-    images satisfy (rare combinations such as bald+female have no usable
-    targets, so training never sees them).
+    labels: (N, A) bool attribute matrix for the mining pool.
+    min_targets: reject a sampled flip set with fewer valid answers than this.
+        The default mirrors the benchmark's own inclusion rule, so training
+        queries are as hard as graded ones instead of systematically easier.
+    n_negatives: how many to draw per family.
+    weights: (A,) optional sampling weights over attributes. Rejection is
+        attribute-dependent - `Mustache` survives it at 6.6%, `Black_Hair` at
+        36.3% - so uniform sampling lets the filter choose the training
+        distribution. Weights of 1/retention pre-compensate for it; None keeps
+        uniform sampling and today's behaviour (proposal S7.1).
     """
 
     def __init__(
         self,
         labels: torch.Tensor,
-        features: torch.Tensor,
-        proxy_rows: list[int],
-        min_candidates: int = 20,
+        min_targets: int = MIN_TARGETS,
+        n_negatives: int = N_NEGATIVES,
+        max_hamming: int = MAX_HAMMING,
+        weights: torch.Tensor | None = None,
         seed: int = 0,
     ) -> None:
-        if labels.shape[0] != features.shape[0]:
-            raise ValueError("labels and features must describe the same images")
-        self.labels = labels.bool().to(features.device)
-        self.features = features
-        self.proxy_rows = proxy_rows
-        self.min_candidates = min_candidates
+        self.labels = labels.bool()
+        self.min_targets = min_targets
+        self.n_negatives = n_negatives
+        self.max_hamming = max_hamming
+        if weights is not None:
+            if weights.shape != (labels.shape[1],):
+                raise ValueError(
+                    f"weights must have one entry per attribute: got "
+                    f"{tuple(weights.shape)} for {labels.shape[1]} attributes"
+                )
+            weights = weights.double().clamp(min=0)
+            if float(weights.sum()) <= 0:
+                raise ValueError("weights must have a positive sum")
+        self.weights = weights
         self.gen = torch.Generator().manual_seed(seed)
 
-    def _satisfies(self, positives: list[int], negatives: list[int]) -> torch.Tensor:
-        """Bool mask over the pool: has every T+ and lacks every T-."""
-        ok = torch.ones(
-            self.labels.shape[0], dtype=torch.bool, device=self.labels.device
-        )
-        if positives:
-            ok &= self.labels[:, positives].all(dim=1)
-        if negatives:
-            ok &= ~self.labels[:, negatives].any(dim=1)
-        return ok
-
-    def _identity_agreement(self, ref: int) -> torch.Tensor:
-        """Per-image count of identity-proxy attributes matching the reference."""
-        proxy = self.labels[:, self.proxy_rows]
-        return (proxy == proxy[ref]).sum(dim=1)
+    # ------------------------------------------------------------------ steps
 
     def _sample_flips(self, ref: int, k: int) -> tuple[list[int], list[int]]:
         """Pick k attributes of the reference to flip, split by flip direction."""
-        state = self.labels[ref]
-        rows = torch.randperm(state.shape[0], generator=self.gen)[:k]
-        positives = [int(a) for a in rows if not state[a]]
-        negatives = [int(a) for a in rows if state[a]]
-        return positives, negatives
-
-    def _pick_violation(
-        self, ref: int, positives: list[int], negatives: list[int]
-    ) -> int:
-        """A near miss: keeps the rest of the query but breaks one constraint.
-
-        With negatives present this is the violation negative of the CPAS
-        recipe (all T+, at least one T-). An all-positive query has no T- to
-        break, so the near miss instead drops one of the requested positives.
-        """
-        if negatives:
-            bad = self.labels[:, negatives].any(dim=1)
-            if positives:
-                bad &= self.labels[:, positives].all(dim=1)
+        a = self.labels.shape[1]
+        if self.weights is None:
+            rows = torch.randperm(a, generator=self.gen)[:k]
         else:
-            bad = ~self.labels[:, positives].all(dim=1)
-        bad[ref] = False
-        return self._closest(ref, bad)
+            rows = torch.multinomial(self.weights, k, replacement=False,
+                                     generator=self.gen)
+        state = self.labels[ref]
+        add = [int(r) for r in rows if not state[r]]
+        remove = [int(r) for r in rows if state[r]]
+        return add, remove
 
-    def _closest(self, ref: int, candidates: torch.Tensor) -> int:
-        """Index of the candidate most similar to the reference, or -1."""
-        rows = candidates.nonzero(as_tuple=True)[0]
+    def _draw(self, pool: torch.Tensor, count: int) -> list[int]:
+        """`count` uniform draws without replacement from a boolean mask."""
+        rows = pool.nonzero(as_tuple=True)[0]
         if rows.numel() == 0:
-            return -1
-        sims = self.features[rows] @ self.features[ref]
-        return int(rows[sims.argmax()])
+            return []
+        take = min(count, rows.numel())
+        picked = torch.randperm(rows.numel(), generator=self.gen)[:take]
+        return rows[picked].tolist()
 
-    def sample(self, k: int, max_tries: int = 20) -> Triplet | None:
-        """Mine one triplet with k flipped attributes, or None if sampling failed."""
+    # ----------------------------------------------------------------- public
+
+    def sample(self, k: int, max_tries: int = 50) -> MinedQuery | None:
+        """Mine one query with k flipped attributes, or None if sampling failed.
+
+        max_tries is deliberately generous. Acceptance is ~10.6% at k = 3, so a
+        small budget would fail often, and `sample_batch` draws a fresh k on
+        failure - which would quietly under-represent the hardest flip count.
+        At 50 tries that leakage is under half a percent.
+        """
         n = self.labels.shape[0]
         for _ in range(max_tries):
             ref = int(torch.randint(n, (1,), generator=self.gen))
-            positives, negatives = self._sample_flips(ref, k)
-            if not positives and not negatives:
+            add, remove = self._sample_flips(ref, k)
+            if not add and not remove:
                 continue
 
-            candidates = self._satisfies(positives, negatives)
-            candidates[ref] = False
-            if int(candidates.sum()) < self.min_candidates:
+            queried = add + remove
+            s = satisfies(self.labels, add, remove)
+            h = hamming_to(self.labels, self.labels[ref], queried)
+            inside = h <= self.max_hamming
+
+            valid = s & inside
+            valid[ref] = False
+            if int(valid.sum()) < self.min_targets:
                 continue
 
-            agreement = self._identity_agreement(ref)
-            sims = self.features @ self.features[ref]
-            # Agreement dominates; similarity only breaks ties within a level.
-            score = agreement.float() + 0.5 * sims
-            score[~candidates] = float("-inf")
-            target = int(score.argmax())
-
-            # Same constraints, least like the reference: forces v_ref to matter.
-            drift = agreement.float() - 0.5 * sims
-            drift[~candidates] = float("inf")
-            drift[target] = float("inf")
-            distractor = int(drift.argmin())
-
-            violation = self._pick_violation(ref, positives, negatives)
-            if violation < 0 or distractor == target:
+            violators = (~s) & inside
+            violators[ref] = False   # it owns a dedicated batch slot; not drawn twice
+            if not bool(violators.any()):
                 continue
-            return Triplet(ref, positives, negatives, target, violation, distractor)
+
+            drifters = s & ~inside
+            if not bool(drifters.any()):
+                continue
+            # The innermost non-empty shell: the candidates that miss the ball by
+            # as little as possible are the ones that teach where its edge is.
+            shell = int(h[drifters].min())
+            drifters &= h == shell
+
+            return MinedQuery(
+                ref=ref,
+                add=add,
+                remove=remove,
+                target=self._draw(valid, 1)[0],
+                violators=self._draw(violators, self.n_negatives),
+                drifters=self._draw(drifters, self.n_negatives),
+            )
         return None
 
-    def sample_batch(self, size: int, ks: tuple[int, ...] = (1,)) -> list[Triplet]:
-        """Mine `size` triplets, drawing each example's flip count from `ks`."""
-        out: list[Triplet] = []
+    def sample_batch(self, size: int, ks: tuple[int, ...] = (1,)) -> list[MinedQuery]:
+        """Mine `size` queries, drawing each example's flip count from `ks`."""
+        out: list[MinedQuery] = []
         while len(out) < size:
             k = int(ks[int(torch.randint(len(ks), (1,), generator=self.gen))])
-            triplet = self.sample(k)
-            if triplet is not None:
-                out.append(triplet)
+            query = self.sample(k)
+            if query is not None:
+                out.append(query)
         return out
 
 
-def proxy_rows(attributes: list[str]) -> list[int]:
-    """Rows of the identity-proxy attributes in `attributes` (order preserved)."""
-    index = {name: i for i, name in enumerate(attributes)}
-    missing = [a for a in IDENTITY_PROXY if a not in index]
-    if missing:
-        raise KeyError(f"identity-proxy attributes absent from labels: {missing}")
-    return [index[a] for a in IDENTITY_PROXY]
+def retention_weights(retention: torch.Tensor, floor: float = 0.01) -> torch.Tensor:
+    """Sampling weights that undo an attribute-dependent rejection rate.
+
+    Rejection is a filter, so P_realised(a) is proportional to
+    P_sampled(a) * retention(a). Sampling at 1/retention(a) therefore lands on a
+    uniform realised distribution - inverse-propensity correction for a filter
+    that cannot be removed.
+
+    `retention` is the per-attribute column of scripts/measure_mining_rule.py,
+    as a fraction. `floor` guards attributes that were never accepted in the
+    measurement, which would otherwise divide by zero and swallow the whole
+    sampling budget.
+
+    This corrects the marginals only. `Male` and `Mustache` together are far
+    worse than either alone, because correlated attributes drag each other out
+    of the ball, and a per-attribute weight cannot see that.
+    """
+    return 1.0 / retention.double().clamp(min=floor)

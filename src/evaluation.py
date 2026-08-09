@@ -5,6 +5,7 @@ from collections.abc import Callable
 import pandas as pd
 import torch
 
+from src.criterion import MAX_HAMMING, valid_mask
 from src.steering import Steerer, pad_queries
 from src.probes import compose_probe
 from src.rerank import Rerank, rank_with_exclusion
@@ -13,11 +14,9 @@ from src.retrieval import PROMPTS, compose, parse_query, rank
 KS = (1, 5, 10)
 VIOLATION_K = 10
 
-# Assignment S3.1.1: a target is valid ground truth iff it strictly satisfies the
-# query's constraints AND its remaining attributes are within this Hamming
-# distance of the reference's. Verified against celeba_evaluation.json by exact
-# set reconstruction on all 33,052 (query, reference) pairs.
-MAX_HAMMING = 2
+# MAX_HAMMING and the rule it belongs to now live in src/criterion.py, shared
+# with the miner so the two cannot drift apart again. It is re-exported here
+# because the benchmark scripts have always imported it from this module.
 
 
 def evaluate_retrieval(
@@ -227,6 +226,9 @@ def build_val_benchmark(
     hyperparameters against ground truth the benchmark does not use, which is
     why validation gains did not transfer to test.
 
+    The rule itself is `src/criterion.valid_mask`, shared with the miner: the
+    two used to carry separate implementations, and only one of them was right.
+
     labels: (N, A) bool for the val pool (references and database are this pool);
     query_specs: (positive rows, negative rows) per query, indexing `labels`;
     directions: (A, D) probe dirs.
@@ -237,21 +239,9 @@ def build_val_benchmark(
     n = labels.shape[0]
     tasks = []
     for pos_rows, neg_rows in query_specs:
-        satisfies = torch.ones(n, dtype=torch.bool)
-        if pos_rows:
-            satisfies &= labels[:, pos_rows].all(dim=1)
-        if neg_rows:
-            satisfies &= ~labels[:, neg_rows].any(dim=1)
-        # The queried attributes differ from the reference by construction, so
-        # they are excluded from the distance, exactly as in S3.1.1.
-        queried = set(pos_rows) | set(neg_rows)
-        others = [a for a in range(labels.shape[1]) if a not in queried]
-        rest = labels[:, others]
-
         refs, masks = [], []
         for r in torch.randperm(n, generator=gen).tolist():
-            close = (rest != rest[r]).sum(dim=1) <= max_hamming
-            gt = satisfies & close
+            gt = valid_mask(labels, labels[r], pos_rows, neg_rows, max_hamming)
             gt[r] = False
             if int(gt.sum()) >= min_gt:
                 refs.append(r)

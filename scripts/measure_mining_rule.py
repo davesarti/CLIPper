@@ -91,7 +91,7 @@ print(f"Benchmark attributes ({len(bench_rows)}): "
 
 
 def sample_flips(ref: int, k: int) -> tuple[list[int], list[int]]:
-    """Same rule as TripletMiner._sample_flips: k random attributes, split by state."""
+    """Same rule as Miner._sample_flips: k random attributes, split by state."""
     state = labels[ref]
     rows = torch.randperm(a, generator=gen)[:k]
     add = [int(r) for r in rows if not state[r]]
@@ -238,6 +238,16 @@ print(f"\nOverall retention: graded {100 * bench_kept / max(bench_old, 1):.1f}% 
       f"vs non-graded {100 * other_kept / max(other_old, 1):.1f}%.")
 print("A large gap means uniform flip sampling lets the rejection step choose\n"
       "the training distribution for us, and choose it away from what is graded.")
+
+# Save the retention column so train_cpas.py --sampling-weights can undo the
+# bias. It is tied to this pool: refitting on a different one makes the table
+# correct for a filter that is no longer the one running.
+out = Path(__file__).resolve().parent.parent / "results" / "mining_retention.pt"
+retention = torch.tensor([pooled_new[r] / max(pooled_old[r], 1) for r in range(a)])
+out.parent.mkdir(exist_ok=True)
+torch.save({"retention": retention, "attributes": attributes,
+            "pool": cache.name, "images": n, "samples": args.samples}, out)
+print(f"\nWrote {out} — pass it to scripts/train_cpas.py --sampling-weights.")
 
 print("\nRead this against S7 of docs/method-proposal-mining-alignment.md before "
       "writing any training code.")
