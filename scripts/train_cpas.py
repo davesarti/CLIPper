@@ -109,7 +109,9 @@ split = int(features.shape[0] * (1 - VAL_FRACTION))
 pools = {"train": perm[:split], "val": perm[split:]}
 train_pool = features[pools["train"]].to(device)
 val_pool = features[pools["val"]].to(device)
-train_labels = labels[pools["train"]]
+# On the training device: the miner walks this matrix once per sampled query,
+# and build_batch walks it again for the false-negative mask.
+train_labels = labels[pools["train"]].to(device)
 
 # Rejection under the S3.1.1 rule is attribute-dependent, so uniform flip
 # sampling lets the filter pick the training distribution for us. Weights of

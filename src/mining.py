@@ -63,7 +63,11 @@ class MinedQuery:
 class Miner:
     """Samples attribute-flip queries from a labelled pool.
 
-    labels: (N, A) bool attribute matrix for the mining pool.
+    labels: (N, A) bool attribute matrix for the mining pool. **Put it on the
+        training device.** Every step of the rule is a pass over this matrix,
+        once per sampled query, so leaving it on the CPU while the rest of the
+        run is on the GPU costs roughly an order of magnitude in wall clock -
+        measured the hard way.
     min_targets: reject a sampled flip set with fewer valid answers than this.
         The default mirrors the benchmark's own inclusion rule, so training
         queries are as hard as graded ones instead of systematically easier.
@@ -116,13 +120,30 @@ class Miner:
         return add, remove
 
     def _draw(self, pool: torch.Tensor, count: int) -> list[int]:
-        """`count` uniform draws without replacement from a boolean mask."""
+        """`count` uniform draws without replacement from a boolean mask.
+
+        Distinct positions are rejection-sampled rather than taken from a
+        permutation of the candidate set. The drifter pool routinely holds tens
+        of thousands of rows, and a randperm over those to keep eight of them,
+        three times per example and 40k examples per epoch, dominated mining
+        time. Duplicates matter here: a repeated negative would carry double
+        weight in the softmax, which is the same reason padding is masked
+        rather than repeated.
+        """
         rows = pool.nonzero(as_tuple=True)[0]
-        if rows.numel() == 0:
+        n = int(rows.numel())
+        if n == 0:
             return []
-        take = min(count, rows.numel())
-        picked = torch.randperm(rows.numel(), generator=self.gen)[:take]
-        return rows[picked].tolist()
+        if count >= n:
+            return rows.tolist()
+        picked: set[int] = set()
+        while len(picked) < count:
+            for i in torch.randint(n, (2 * count,), generator=self.gen).tolist():
+                picked.add(i)
+                if len(picked) == count:
+                    break
+        idx = torch.tensor(sorted(picked), device=rows.device)
+        return rows[idx].tolist()
 
     # ----------------------------------------------------------------- public
 
