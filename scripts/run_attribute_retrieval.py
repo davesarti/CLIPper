@@ -24,11 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.attribute_head import load_attribute_head
 from src.attribute_retrieval import rank_by_attributes, target_code
+from src.cpas_mlp import PerAttributeMLP
 from src.data import get_paths, load_annotations, load_dataset
 from src.evaluation import MAX_HAMMING, _query_row, _with_mean_row, negation_subset
 from src.features import ClipEncoder, load_or_extract, load_pool, resolve_pool
 from src.probes import load_probes, load_raw_probes
 from src.retrieval import parse_query
+from src.steering import pad_queries
 
 torch.set_grad_enabled(False)
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -52,10 +54,17 @@ parser.add_argument("--no-cosine", action="store_true",
                     help="score by attributes alone: pin w_cos = 0 instead of "
                          "sweeping it, dropping every embedding term from the "
                          "ranking (docs/method.md S5, third term)")
+parser.add_argument("--checkpoint", type=Path, default=None,
+                    help="CPAS-MLP checkpoint. With it the third term of the "
+                         "score uses the composed query q instead of the raw "
+                         "reference v_ref, which is the only configuration in "
+                         "which the assignment's fusion module actually enters "
+                         "the delivered ranking. Default: q = v_ref")
 args = parser.parse_args()
 cos_grid = (0.0,) if args.no_cosine else COS_GRID
 if args.out is None:
     stem = "attribute_retrieval_no_cosine" if args.no_cosine \
+        else "attribute_retrieval_cpas" if args.checkpoint \
         else "attribute_retrieval"
     args.out = REPO_ROOT / "results" / f"{stem}.csv"
 
@@ -68,6 +77,40 @@ directions, _, attributes = load_probes(REPO_ROOT)
 W, B, _ = load_raw_probes(REPO_ROOT)
 attr_index = {name: i for i, name in enumerate(attributes)}
 queries = [parse_query(e["query"]) for e in annotations]
+
+# ------------------------------------------------------------- combiner
+# The third term of the score is a cosine against *some* query vector. By
+# default that vector is the raw reference: the attribute terms already carry
+# the constraints, so all this term has left to do is preserve identity, and
+# v_ref is the purest identity signal available. Passing a checkpoint swaps in
+# the composed query instead, which is the only configuration where the
+# assignment's fusion module reaches the delivered ranking.
+combiner = None
+if args.checkpoint:
+    checkpoint = torch.load(args.checkpoint, weights_only=True)
+    config = dict(checkpoint.get("config", {}))
+    config.pop("arch", None)          # pre---arch checkpoints tag the variant
+    combiner = PerAttributeMLP(**config)
+    combiner.load_state_dict(checkpoint["state_dict"])
+    combiner.eval()
+    print(f"combiner {args.checkpoint.name}: epoch {checkpoint.get('epoch')}, "
+          f"val R@10 {checkpoint.get('val_r10', float('nan')):.4f}")
+else:
+    print("no --checkpoint: the cosine term uses the raw reference (q = v_ref)")
+
+
+def cosine_term(db, refs, pos_rows, neg_rows):
+    """(N, R) similarity of the query vector to the database.
+
+    Used identically in the validation sweep and on the test benchmark: tuning
+    (lam, w_cos) against one query vector and then reporting with another would
+    select hyperparameters for a model that is not the one measured.
+    """
+    if combiner is None:
+        return db @ db[refs].T
+    dirs, signs, mask = pad_queries([(pos_rows, neg_rows)] * len(refs), directions)
+    return db @ combiner(db[refs], dirs, signs, mask).T
+
 
 # ------------------------------------------------------------ predictors
 predictors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -111,7 +154,7 @@ def val_recall(probs, code, lam, w_cos) -> float:
         if pr: sat &= val_labels[:, pr].all(dim=1)
         if nr: sat &= ~val_labels[:, nr].any(dim=1)
         rest = val_labels[:, others]
-        cos = val_features @ val_features[val_refs].T if w_cos else None
+        cos = cosine_term(val_features, val_refs, pr, nr) if w_cos else None
         order = rank_by_attributes(
             probs, code, target_code(code[val_refs], pr, nr), pr, nr,
             exclude=val_refs.tolist(), lam_constraint=lam,
@@ -155,7 +198,7 @@ for name, (probs, code) in predictors.items():
         pr = [attr_index[a] for a in pos]; nr = [attr_index[a] for a in neg]
         sources = [int(k) for k in entry["ground_truth"].keys()]
         src = torch.tensor(sources)
-        cos = features @ features[src].T if w_cos else None
+        cos = cosine_term(features, src, pr, nr) if w_cos else None
         order = rank_by_attributes(
             probs, code, target_code(code[src], pr, nr), pr, nr,
             exclude=sources, lam_constraint=lam, cosine=cos, w_cos=w_cos,
