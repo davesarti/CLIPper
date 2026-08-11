@@ -51,22 +51,35 @@ def expected_hamming(
     db_probs: torch.Tensor,
     ref_code: torch.Tensor,
     rows: list[int],
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """(N, R) expected number of attributes in `rows` where a database image
     disagrees with each reference code.
 
-    E[disagreements] = sum_a  p_a (1 - r_a) + (1 - p_a) r_a, computed as two
-    matrix products so the whole database is scored for a block of references at
-    once.
+    E[disagreements] = sum_a  w_a [ p_a (1 - r_a) + (1 - p_a) r_a ], computed as
+    two matrix products so the whole database is scored for a block of
+    references at once.
 
-    db_probs: (N, A) predicted probabilities; ref_code: (R, A) bool.
+    db_probs: (N, A) predicted probabilities; ref_code: (R, A) bool, or float
+    probabilities to keep the reference's own uncertainty in the distance -
+    thresholding it first spends the Hamming budget on attributes neither side
+    knew anything about.
+
+    weights: optional (A,) per-attribute weight, indexed by the same `rows`.
+    None means a uniform weight of 1 and reproduces the unweighted distance
+    exactly, which is what makes the weighting separately ablatable.
     """
     if not rows:
         return torch.zeros(db_probs.shape[0], ref_code.shape[0],
                            device=db_probs.device)
     p = db_probs[:, rows]
     r = ref_code[:, rows].to(p.dtype)
-    return p @ (1 - r).T + (1 - p) @ r.T
+    if weights is None:
+        return p @ (1 - r).T + (1 - p) @ r.T
+    # w - pw is w * (1 - p): scaling the candidate side keeps both matmuls.
+    w = weights[rows].to(p)
+    pw = p * w
+    return pw @ (1 - r).T + (w - pw) @ r.T
 
 
 def constraint_violation(
@@ -92,6 +105,7 @@ def attribute_scores(
     lam_constraint: float = 100.0,
     cosine: torch.Tensor | None = None,
     w_cos: float = 0.0,
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """(R, N) scores, higher is better, for one query and a block of references.
 
@@ -99,11 +113,14 @@ def attribute_scores(
     ref_code: (R, A) bool codes of the references (already query-adjusted by
     `target_code`, or raw - the queried columns are excluded either way);
     cosine: optional (N, R) similarity of the composite query embedding to the
-    database, blended in with weight w_cos.
+    database, blended in with weight w_cos;
+    weights: optional (A,) per-attribute weight for the Hamming term. The
+    constraint term is deliberately left unweighted - it is a conjunctive
+    condition, not a distance.
     """
     others = [a for a in range(db_probs.shape[1])
               if a not in set(pos_rows) | set(neg_rows)]
-    score = -expected_hamming(db_probs, ref_code, others)          # (N, R)
+    score = -expected_hamming(db_probs, ref_code, others, weights)  # (N, R)
     score = score - lam_constraint * constraint_violation(
         db_code, pos_rows, neg_rows
     ).unsqueeze(1)

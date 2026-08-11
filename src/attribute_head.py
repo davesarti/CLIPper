@@ -77,6 +77,47 @@ def tune_thresholds(logits: torch.Tensor, labels: torch.Tensor,
     return out
 
 
+@torch.no_grad()
+def attribute_reliability(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """(A,) Youden's J per attribute: sensitivity + specificity - 1.
+
+    Zero for a predictor that answers one class regardless of its input, one for
+    a perfect one. Per-attribute *accuracy* cannot serve here: CelebA attributes
+    are heavily imbalanced, so always answering the majority class scores 88% on
+    Wearing_Necklace (12% positive rate) while detecting nothing at all, and
+    would earn a large weight for an attribute the predictor is blind to.
+
+    pred / labels: (N, A) bool, thresholded predictions and true labels, so the
+    same function serves the linear probe and the MLP head. An attribute with no
+    positives or no negatives in `labels` returns 0: its rate is undefined, and
+    0 is exactly the "carries no information" weight.
+    """
+    p, y = pred.bool(), labels.bool()
+    pos = y.sum(0).float()
+    neg = (~y).sum(0).float()
+    sensitivity = (p & y).sum(0).float() / pos.clamp(min=1.0)
+    specificity = ((~p) & (~y)).sum(0).float() / neg.clamp(min=1.0)
+    j = sensitivity + specificity - 1.0
+    return torch.where((pos > 0) & (neg > 0), j, torch.zeros_like(j))
+
+
+@torch.no_grad()
+def reliability_weights(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """(A,) non-negative per-attribute weights averaging 1, from held-out data.
+
+    Youden's J clamped at zero and rescaled. The clamp is not cosmetic: a
+    negative weight would invert the target bit, so the score would actively ask
+    for the opposite of what the reference has, and on held-out data a negative
+    J is noise rather than an anti-correlated attribute worth exploiting.
+
+    The rescaling keeps the Hamming term on the scale lam_constraint was swept
+    against, so a run with weights stays comparable to one without.
+    """
+    j = attribute_reliability(pred, labels).clamp(min=0.0)
+    mean = j.mean()
+    return j / mean if float(mean) > 0 else torch.ones_like(j)
+
+
 def fit_attribute_head(
     features: torch.Tensor,
     labels: torch.Tensor,
