@@ -209,7 +209,10 @@ def sweep(tag: str, probs, code, corruption, seed):
             rows.append({"predictor": tag, "corruption": corruption,
                          "seed": seed, "bit_accuracy": acc,
                          "q_source": source, "w_cos": w, "val_R10": r10})
-            print(f"  {tag:12s} c={corruption:<5} s={seed} {source:6s} "
+            # The anchor carries no corruption level, so it cannot be formatted
+            # as a number.
+            c_txt = "-" if corruption is None else f"{corruption:.2f}"
+            print(f"  {tag:12s} c={c_txt:<5} s={seed:<2} {source:6s} "
                   f"w={w:<5} acc={acc:.4f} R@10={r10:.4f}", flush=True)
 
 
