@@ -1,6 +1,6 @@
-# Clipper: compositional image retrieval on CelebA
+# CLIPper: compositional image retrieval on CelebA
 
-Clipper retrieves images from the CelebA test split given a reference image and
+CLIPper retrieves images from the CelebA test split given a reference image and
 attribute constraints such as `+Smiling, -Blond_Hair`. CLIP ViT-B/32 is kept
 frozen. The delivered method predicts the 40 CelebA attributes from CLIP image
 features, builds a soft target code, and ranks candidates with the assignment's
