@@ -1,109 +1,167 @@
-# Clipper — compositional image retrieval on CelebA
+# Clipper: compositional image retrieval on CelebA
 
-DL 2026 assignment (`Project assignment - V1.2.pdf`). Given a reference image and a
-query like `"+Smiling, -Blond_Hair"`, retrieve images from the 19,962-image CelebA test
-split that keep the reference's identity, have every `+` attribute and lack every `−`
-one. CLIP ViT-B/32 stays frozen throughout; only the query embedding is built.
+Clipper retrieves images from the CelebA test split given a reference image and
+attribute constraints such as `+Smiling, -Blond_Hair`. CLIP ViT-B/32 is kept
+frozen. The delivered method predicts the 40 CelebA attributes from CLIP image
+features, builds a soft target code, and ranks candidates with the assignment's
+ground-truth criterion: expected Hamming distance on non-queried attributes plus
+a penalty for violating queried constraints. CPAS-MLP supplies the composed
+query embedding used by the small cosine term in the final score.
 
-- **Baseline**: latent arithmetic over CLIP *text* prompts,
-  `q = normalize(v_ref + Σt⁺ − Σt⁻)`. No training.
-- **Current method**: retrieval scored directly against the assignment's ground-truth
-  criterion (§3.1.1) — expected Hamming distance on the non-queried attributes plus a
-  constraint penalty — over attribute codes predicted by a small head on frozen CLIP
-  features. The CPAS-MLP combiner supplies the composite query embedding.
+## Notebook
 
-Two documents, kept deliberately apart:
+The primary reproducible artifact is [`Clipper_Report_out.ipynb`](Clipper_Report_out.ipynb).
+It is the executed version of the report and contains the complete pipeline:
 
-- **`docs/method.md`** — the current pipeline and nothing else: the ground-truth
-  criterion, attribute prediction, the scoring rule, the combiner, the evaluation
-  protocol, current results, and what is still open. **Start here.**
-- **`docs/method-history.md`** — how the method was arrived at, and what was tried and
-  dropped (prompt arithmetic, attribute captions, the transformer combiner, SCAC).
-  Read it for *why* the design is what it is.
+1. load CelebA and `celeba_evaluation.json`;
+2. load or extract frozen CLIP features for train, valid and test;
+3. fit the linear probes and the MLP attribute head;
+4. train or load CPAS-MLP, selecting it on the held-out validation benchmark;
+5. sweep the validation hyperparameters when requested;
+6. evaluate the baseline, ablations and delivered method on the 14 mandatory
+   test queries.
 
-## Layout
-
-- `src/` — `data.py`, `features.py` (CLIP wrapper + feature cache), `retrieval.py`
-  (prompts, `compose()`/`rank()`), `probes.py` (linear attribute probes and the fixed
-  composition rule), `evaluation.py` (metrics, benchmarks, probe-drift diagnostic),
-  `steering.py` (shared composition + padding), `mining.py` (triplet mining),
-  `training.py` (InfoNCE loop), `cpas_mlp.py` (the combiner),
-  `rerank.py` (constraint penalty), `attribute_head.py` (attribute predictor),
-  `attribute_retrieval.py` (the ground-truth-criterion score)
-- `scripts/` — `run_baseline.py`, `extract_train_features.py`,
-  `fit_probes.py`, `run_probe_accuracy.py`, `run_probe_gamma_ablation.py`,
-  `train_cpas.py`, `run_cpas_ablation.py`, `run_exclusion_rerank.py`,
-  `fit_attribute_head.py`, `run_attribute_retrieval.py`
-- `docs/` — `method.md` (the current pipeline) and `method-history.md` (what was tried
-  and dropped, and why)
-- `results/` — benchmark CSVs and probe weights; `results/archive/` holds output from
-  abandoned approaches (nothing reads it)
-- `tests/` — 97 pytest tests, model-free
-
-## Setup
-
-Put CelebA under `./celeba/` and `celeba_evaluation.json` at the repo root, then:
+Open the notebook, restart the kernel, and run all cells from top to bottom. To
+execute it without the Jupyter UI:
 
 ```bash
-conda create -n clipper python=3.11 -y
-conda run -n clipper pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision  # CPU build; skip flag on GPU
-conda run -n clipper pip install -r requirements.txt
-conda run -n clipper pytest -q
+conda run -n clipper jupyter nbconvert \
+  --to notebook --execute --inplace Clipper_Report_out.ipynb
 ```
 
-## Run
+The notebook uses `seed=0` for the train/validation split and sampling. Its
+delivered configuration is:
 
-```bash
-# baseline (~45 min CPU for feature extraction, then cached)
-conda run -n clipper python scripts/run_baseline.py
-
-# probe directions + gamma sweep
-conda run -n clipper python scripts/extract_train_features.py         # 30k train sample
-conda run -n clipper python scripts/fit_probes.py
-conda run -n clipper python scripts/run_probe_gamma_ablation.py
-
-# CPAS-MLP (GPU-oriented)
-conda run -n clipper python scripts/extract_train_features.py --all   # full mining pool
-conda run -n clipper python scripts/train_cpas.py --seed 0 --out runs/mlp_s0.pt
-conda run -n clipper python scripts/run_cpas_ablation.py "CPAS-MLP=runs/mlp_s0.pt"
-
-# current method: attribute head, then attribute-space retrieval
-conda run -n clipper python scripts/fit_attribute_head.py
-conda run -n clipper python scripts/run_attribute_retrieval.py --head results/attribute_head.pt
-
-# exclusion re-rank on the cosine pipeline (lambda swept on validation)
-conda run -n clipper python scripts/run_exclusion_rerank.py --checkpoint runs/mlp_s0.pt
-
+```text
+soft_reference = True
+lambda_constraint = 4
+w_cos = 1
+head = results/attribute_head.pt
+CPAS-MLP = results/mlp_final_s0.pt
+probes = results/probe_weights.pt
 ```
+
+`RUN_SWEEP` is `False` by default because the reported values already come
+from the fixed validation sweep. Set it to `True` in the configuration cell to
+recompute the $(lambda, w)$ sweep. The notebook creates missing model files;
+the first complete run therefore takes considerably longer than a run using
+the cached artifacts.
 
 ## Results
 
-MEAN over the 14 benchmark queries, full test-split database:
+The figures below are from the last notebook execution. They average over the
+14 benchmark queries and 33,052 query-reference pairs, using the complete
+19,962-image CelebA test split. `V@10` is the fraction of top-10 results that
+break a queried constraint.
 
-| method | R@1 | R@5 | R@10 |
-|---|---|---|---|
-| Prompt arithmetic baseline (γ = 1) | 0.023 | 0.071 | 0.106 |
-| Probe-direction composition (γ = 0.6) | 0.051 | 0.144 | 0.210 |
-| CPAS-MLP (best cosine-space method) | 0.066 | 0.182 | 0.267 |
-| **Attribute-space scoring, linear probe** | 0.116 | 0.336 | **0.465** |
-| **Attribute-space scoring, MLP head** | — | — | **0.482** |
-| *oracle attribute codes (ceiling)* | *1.000* | *1.000* | *1.000* |
+| method | R@10 | V@10 |
+|---|---:|---:|
+| Zero-shot prompt arithmetic baseline | 0.106 | 0.834 |
+| Attribute-space, linear probe, hard reference | 0.482 | 0.307 |
+| Attribute-space, MLP head, hard reference | 0.503 | 0.304 |
+| Attribute-space, MLP head, soft reference, no cosine | 0.530 | 0.312 |
+| **Delivered: MLP head + soft reference + CPAS-MLP** | **0.535** | **0.306** |
+| Oracle attribute codes | 1.000 | 0.000 |
 
-The jump comes from ranking by the criterion the ground truth is defined by rather
-than by cosine similarity to a composed vector — see `docs/method.md` §1 and §7.
-Attribute-prediction accuracy is now the only lever: +0.003 bit accuracy bought
-+0.022 R@10.
+The delivered score is selected on held-out data, not on the 14 test queries.
+The validation sweep selects the plateau beginning at `lambda=4`; `w=1` is
+kept in the delivered configuration because it preserves the CPAS query term,
+although the difference between nearby cosine weights is within the observed
+sampling noise. The valid bit accuracy is 0.9110 for the linear probe and
+0.9149 for the MLP head.
 
-Per-query tables in `results/`. Absolute numbers shift slightly with the probe refit, so
-compare against the fixed-rule row recomputed by the same run — see
-`docs/method.md` §8.
+The main conclusion is a change of scoring space, not just a better query
+embedding: ranking directly by predicted attributes raises R@10 from 0.106 to
+0.535. Results within about 0.02 R@10 should be treated as unresolved because
+of benchmark sampling variability. See [`docs/method.md`](docs/method.md) for
+the full criterion, ablations and limitations; [`docs/method-history.md`](docs/method-history.md)
+records discarded approaches.
 
-## Gotchas
+## Data and environment
 
-- Ground truth is **not** semantic similarity: assignment §3.1.1 defines a correct
-  answer as one satisfying the constraints with Hamming distance ≤ 2 to the reference
-  on the non-queried attributes. Rank by that, not by cosine.
-- Ground-truth keys are **dataset indices**, not filenames: use `celeba[int(key)]`.
-- The test split is the retrieval database and is never trained or selected on;
-  training mines triplets from the train split, model selection uses a held-out val
-  benchmark.
+Run commands from the repository root. Place the official CelebA directory at
+`./celeba/` and keep `celeba_evaluation.json` at the repository root. The
+dataset must contain the standard `img_align_celeba/` directory and annotation
+files. The notebook downloads the CLIP text/model components through
+Transformers on first use, so network access is needed unless the model cache
+already exists.
+
+```bash
+conda create -n clipper python=3.11 -y
+conda run -n clipper pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+conda run -n clipper pip install -r requirements-min.txt
+```
+
+The CPU installation is reproducible but slow for feature extraction and CPAS
+training. Install the matching CUDA build of PyTorch first when a GPU is
+available. `requirements.txt` is the captured environment from the report; use
+it instead of `requirements-min.txt` only when that exact package snapshot is
+required.
+
+Before a full notebook run, the model-free test suite provides a cheap sanity
+check:
+
+```bash
+conda run -n clipper pytest -q
+```
+
+## Script-only reproduction
+
+The scripts mirror the notebook for users who prefer a command-line workflow.
+The following sequence starts from the dataset and regenerates the main
+artifacts. `--all` is important: it uses the complete train/valid split rather
+than the optional 30k training sample.
+
+```bash
+# frozen CLIP features
+conda run -n clipper python scripts/extract_train_features.py --split train --all
+conda run -n clipper python scripts/extract_train_features.py --split valid --all
+
+# probe weights and nonlinear attribute head
+conda run -n clipper python scripts/fit_probes.py
+conda run -n clipper python scripts/fit_attribute_head.py \
+  --out results/attribute_head.pt
+
+# CPAS-MLP; defaults match the notebook (seed 0, 5 warmup + 45 main epochs)
+conda run -n clipper python scripts/train_cpas.py \
+  --seed 0 --out results/mlp_final_s0.pt
+
+# delivered attribute-space benchmark
+conda run -n clipper python scripts/run_attribute_retrieval.py \
+  --head results/attribute_head.pt \
+  --checkpoint results/mlp_final_s0.pt \
+  --soft-reference \
+  --out results/attribute_retrieval_cpas_soft.csv
+
+# zero-shot baseline for comparison
+conda run -n clipper python scripts/run_baseline.py
+```
+
+The retrieval script performs its own validation sweep and writes the selected
+test results plus per-query output under `results/`. `--no-cosine` reproduces
+the attribute-only ablation. Refit probes before comparing new runs: probe
+weights define both the attribute classifier and CPAS edit directions, so
+changing them invalidates the shipped benchmark rows. Feature caches and model
+checkpoints are deliberately kept out of the source-only workflow when they
+are not already present; the scripts regenerate them in `features/`,
+`results/` or the path supplied with `--out`.
+
+## Repository layout
+
+- `Clipper_Report_out.ipynb` - executed, notebook-first reproduction and report.
+- `Clipper_Report.ipynb` - report notebook source.
+- `src/` - data loading, feature extraction, probes, CPAS-MLP, scoring and evaluation.
+- `scripts/` - command-line equivalents of the notebook stages.
+- `features/` - cached CLIP features and shipped attribute/probe artifacts.
+- `results/` - current benchmark tables; `results/archive/` contains superseded runs.
+- `tests/` - model-free unit tests.
+
+## Important evaluation details
+
+- The test split is used only as the retrieval database and final benchmark.
+- CPAS-MLP is trained on the train split and selected on a held-out train slice.
+- Attribute-head epochs and thresholds are selected on the valid split.
+- Ground-truth keys are dataset indices, not filenames: use `celeba[int(key)]`.
+- Ground truth is not generic semantic similarity. It is defined by queried
+  attribute constraints and a maximum Hamming distance of 2 on the remaining
+  attributes.
