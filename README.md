@@ -156,12 +156,11 @@ are not already present; the scripts regenerate them in `features/`,
 - `results/` - current benchmark tables; `results/archive/` contains superseded runs.
 - `tests/` - model-free unit tests.
 
-## Important evaluation details
+## Evaluation details
 
 - The test split is used only as the retrieval database and final benchmark.
 - CPAS-MLP is trained on the train split and selected on a held-out train slice.
 - Attribute-head epochs and thresholds are selected on the valid split.
 - Ground-truth keys are dataset indices, not filenames: use `celeba[int(key)]`.
-- Ground truth is not generic semantic similarity. It is defined by queried
-  attribute constraints and a maximum Hamming distance of 2 on the remaining
+- Ground is defined by queried attribute constraints and a maximum Hamming distance of 2 on the remaining
   attributes.
